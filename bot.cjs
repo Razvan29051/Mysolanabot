@@ -1,22 +1,18 @@
-import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
-import bs58 from 'bs58';
-import fetch from 'cross-fetch';
+const { Connection, Keypair, VersionedTransaction } = require('@solana/web3.js');
+const bs58 = require('bs58');
+const fetch = require('cross-fetch');
 
-// Load keys securely from your GitHub Secrets
 const connection = new Connection(process.env.RPC_URL, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(process.env.BOT_PRIVATE_KEY));
 
 async function runAutoTrade() {
   console.log(`🤖 Bot Active | Executing for Wallet: ${wallet.publicKey.toString()}`);
 
-  // Token Mints (SOL & Meme Coin Target)
   const SOL_MINT = 'So11111111111111111111111111111111111111112';
-  const WIF_MINT = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm'; // DogWifHat
-  
-  const tradeAmountLamports = 0.02 * 1e9; // Amount to trade: 0.02 SOL (~$3-$4)
+  const WIF_MINT = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm';
+  const tradeAmountLamports = 0.02 * 1e9; // 0.02 SOL
 
   try {
-    // 1. Fetch live swap quote from Jupiter DEX Aggregator
     console.log("Fetching live DEX quote...");
     const quoteRes = await fetch(
       `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${WIF_MINT}&amount=${tradeAmountLamports}&slippageBps=100`
@@ -25,7 +21,6 @@ async function runAutoTrade() {
 
     if (quote.error) throw new Error(quote.error);
 
-    // 2. Build serialized transaction from Jupiter
     const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -39,12 +34,10 @@ async function runAutoTrade() {
     });
     const { swapTransaction } = await swapRes.json();
 
-    // 3. Sign transaction using your dedicated bot private key
     const swapBuf = Buffer.from(swapTransaction, 'base64');
     const transaction = VersionedTransaction.deserialize(swapBuf);
     transaction.sign([wallet]);
 
-    // 4. Send signed transaction directly to Solana Mainnet
     console.log("Broadcasting live trade to Solana Mainnet...");
     const rawTx = transaction.serialize();
     const txid = await connection.sendRawTransaction(rawTx, { skipPreflight: true });
