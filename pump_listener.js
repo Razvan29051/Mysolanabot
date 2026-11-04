@@ -17,7 +17,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Momentum Wave Rider Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Quick Scalper Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -53,13 +53,12 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Position Manager: Tracks green waves and secures profits on an 8% pullback
-async function monitorAndExit(tokenMint, buyAmountUnits) {
-  console.log(`👀 [Wave Rider] Tracking price action for ${tokenMint.slice(0, 8)}...`);
+// Quick Scalper Position Manager: Exits at the first sign of green above gas costs
+async function monitorAndExitQuick(tokenMint, buyAmountUnits, initialSolSpent) {
+  console.log(`👀 [Quick Scalper] Monitoring entry for instant green exit...`);
   
-  let peakValue = 0;
   const startTime = Date.now();
-  const maxHoldTimeMs = 3 * 60 * 1000; // 3-minute momentum cap
+  const maxHoldTimeMs = 90 * 1000; // Quick 90-second max timeout for fast scalps
 
   const checkInterval = setInterval(async () => {
     try {
@@ -70,24 +69,26 @@ async function monitorAndExit(tokenMint, buyAmountUnits) {
       if (!quote || quote.error) return;
 
       const currentValueSol = parseInt(quote.outAmount) / 1e9;
-      if (currentValueSol > peakValue) peakValue = currentValueSol;
+      console.log(`📈 [Scalp Check] Spent: ${initialSolSpent.toFixed(4)} SOL | Current Value: ${currentValueSol.toFixed(4)} SOL`);
 
-      console.log(`📈 [Green Wave Check] Current: ${currentValueSol.toFixed(4)} SOL (Peak: ${peakValue.toFixed(4)} SOL)`);
-
-      // Exit Condition: Secure profits if price pulls back 8% from its green peak, or hits timeout
-      const pulledBackFromPeak = peakValue > 0.005 && currentValueSol < peakValue * 0.92;
+      // Target: Exit immediately if current value exceeds initial cost by at least 2.5% (covers double swap gas + net profit)
+      const targetProfitValue = initialSolSpent * 1.025;
+      const isGreen = currentValueSol >= targetProfitValue;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
-      if (pulledBackFromPeak || timedOut) {
+      // Also include a tight stop-loss safeguard (-10%) so a dump doesn't anchor your bag
+      const isStopLoss = currentValueSol <= initialSolSpent * 0.90;
+
+      if (isGreen || isStopLoss || timedOut) {
         clearInterval(checkInterval);
-        console.log(`🚨 [Profit Lock] Selling token to secure gains...`);
+        console.log(isGreen ? `🟢 [Instant Green Target Hit!] Selling for profit...` : `🚨 [Exit Triggered] Cut loss/Timeout reached...`);
         
         const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
-        console.log(`✅ [PROFIT SECURED!] Solscan: https://solscan.io/tx/${sellTxid}`);
+        console.log(`✅ [SOLD!] Solscan: https://solscan.io/tx/${sellTxid}`);
         isTrading = false;
       }
     } catch (e) {}
-  }, 5000);
+  }, 3000); // Polls every 3 seconds for lightning-fast reaction times
 }
 
 async function handleSnipe(signature) {
@@ -96,7 +97,6 @@ async function handleSnipe(signature) {
     const balanceSol = balanceLamports / 1e9;
     
     if (balanceSol < 0.015) {
-      console.log(`⚠️ Balance too low (${balanceSol.toFixed(4)} SOL).`);
       isTrading = false;
       return;
     }
@@ -114,7 +114,7 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // --- INITIAL METADATA & SOCIAL CHECK ---
+    // Metadata & Social Check
     try {
       const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (coinRes.ok) {
@@ -123,78 +123,50 @@ async function handleSnipe(signature) {
         const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
 
         if (!coinData.description || coinData.description.length < 5 || (!hasTwitter && !hasTelegram)) {
-          console.log(`🚫 [Filter] Skipped: Lacks proper description or social links.`);
           isTrading = false;
           return;
         }
       }
     } catch (e) {}
 
-    // --- 15-SECOND MOMENTUM DELAY ---
-    console.log(`⏳ [Delay Window] Waiting 15s to check volume formation for ${newMint.slice(0, 8)}...`);
-    await new Promise(resolve => setTimeout(resolve, 15000));
+    // Short 10-second delay to clear initial spam
+    await new Promise(resolve => setTimeout(resolve, 10000));
 
-    // --- VOLUME & SURVIVAL VALIDATION ---
-    try {
-      const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (checkRes.ok) {
-        const checkData = await checkRes.json();
-        
-        // Skip if bonding curve already completed or virtual reserves indicate a dead launch
-        if (checkData.complete) {
-          console.log(`🚫 [Volume Filter] Token already graduated/completed. Skipping.`);
-          isTrading = false;
-          return;
-        }
-
-        // Ensure there is active volume growth (virtual sol reserves must increase past initial baseline)
-        const currentSolReserves = checkData.virtual_sol_reserves || 0;
-        if (currentSolReserves < 3200000000) { // below threshold means no green wave formed
-          console.log(`🚫 [Volume Filter] Token failed to attract green volume during delay. Skipping.`);
-          isTrading = false;
-          return;
-        }
-      }
-    } catch (e) {}
-
-    // Conservative 20% Position Sizing with gas protection
+    // Position Sizing (20%)
     const ALLOCATION_PERCENTAGE = 0.20; 
     const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Green Wave Confirmed] Token Mint: ${newMint}`);
-    console.log(`🚀 [Riding Wave] Buying with ${solToAllocate.toFixed(4)} SOL...`);
+    console.log(`🚀 [Scalp Buying] Entering token ${newMint.slice(0, 8)} with ${solToAllocate.toFixed(4)} SOL...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
-    console.log(`✅ [ENTRY SUCCESSFUL] Solscan: https://solscan.io/tx/${txid}`);
+    console.log(`✅ [BUY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
 
     setTimeout(async () => {
       try {
         const tokenAccountsRes = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: newMint });
         const tokenUnits = tokenAccountsRes.value[0]?.account?.data?.parsed?.info?.tokenAmount?.amount;
         if (tokenUnits) {
-          monitorAndExit(newMint, tokenUnits);
+          monitorAndExitQuick(newMint, tokenUnits, solToAllocate);
         } else {
-          console.log(`⚠️ Balance units unverified. Resetting lock.`);
           isTrading = false;
         }
       } catch (err) {
         isTrading = false;
       }
-    }, 5000);
+    }, 4000);
 
   } catch (err) {
-    console.error(`❌ Execution Error: ${err.message}`);
     isTrading = false;
   }
 }
 
 function startListener() {
-  console.log("🌊 [Momentum Wave Sniper Engine] Connecting...");
+  console.log("⚡ [Quick Scalper Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for organic green waves...");
+    console.log("🟢 [Connected] Scanning for instant green scalps...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -216,14 +188,12 @@ function startListener() {
 
       if (logs.some(log => log.includes("Instruction: Create")) && !isTrading) {
         isTrading = true;
-        console.log(`\n🚨 [NEW LAUNCH DETECTED] Signature: ${signature.slice(0, 8)}...`);
         await handleSnipe(signature);
       }
     } catch (e) {}
   });
 
   ws.on('close', () => {
-    console.log("🔴 Stream closed. Reconnecting in 3s...");
     setTimeout(startListener, 3000);
   });
 
