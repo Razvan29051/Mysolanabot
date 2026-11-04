@@ -53,6 +53,45 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
+// Monitor and sell on green spikes or 8% trailing pullbacks
+async function monitorAndExit(tokenMint, buyAmountUnits) {
+  console.log(`👀 [Position Manager] Tracking price action for ${tokenMint.slice(0, 8)}...`);
+  
+  let peakValue = 0;
+  const startTime = Date.now();
+  const maxHoldTimeMs = 3 * 60 * 1000; // Max hold 3 minutes
+
+  const checkInterval = setInterval(async () => {
+    try {
+      const quoteRes = await fetch(
+        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${buyAmountUnits}&slippageBps=500`
+      );
+      const quote = await quoteRes.json();
+      if (!quote || quote.error) return;
+
+      const currentValueSol = parseInt(quote.outAmount) / 1e9;
+      if (currentValueSol > peakValue) peakValue = currentValueSol;
+
+      console.log(`📈 [Price Check] Current Value: ${currentValueSol.toFixed(4)} SOL (Peak: ${peakValue.toFixed(4)} SOL)`);
+
+      // Exit Condition: Trigger sell if price drops 8% from its peak green high
+      const pulledBackFromPeak = peakValue > 0.005 && currentValueSol < peakValue * 0.92;
+      const timedOut = Date.now() - startTime > maxHoldTimeMs;
+
+      if (pulledBackFromPeak || timedOut) {
+        clearInterval(checkInterval);
+        console.log(`🚨 [Exit Triggered] Selling token (8% pullback from peak reached)...`);
+        
+        const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
+        console.log(`✅ [SOLD!] Solscan: https://solscan.io/tx/${sellTxid}`);
+        isTrading = false;
+      }
+    } catch (e) {
+      // Ignore transient network errors
+    }
+  }, 5000);
+}
+
 async function handleSnipe(signature) {
   try {
     const balanceLamports = await connection.getBalance(wallet.publicKey);
@@ -60,50 +99,73 @@ async function handleSnipe(signature) {
     
     if (balanceSol < 0.015) {
       console.log(`⚠️ Balance too low (${balanceSol.toFixed(4)} SOL). Minimum required is 0.015 SOL.`);
+      isTrading = false;
       return;
     }
-
-    // --- POSITION SIZING ---
-    // Configured for 20% allocation of available SOL balance (reserving 0.005 SOL for network fees)
-    const ALLOCATION_PERCENTAGE = 0.20; 
-    const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
-
-    const amountLamports = Math.floor(solToAllocate * 1e9);
 
     const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 1 });
-    if (!tx || !tx.meta) return;
-
-    // Safety Filter: Check Dev Wallet Allocation
-    const postTokenBalances = tx.meta.postTokenBalances || [];
-    const devBalance = postTokenBalances[0]?.uiTokenAmount?.uiAmount || 0;
-
-    if (devBalance > 200000000) { // Over 20% total supply bought by dev
-      console.log(`🚫 [Safety Filter] Skipped high-risk token (Dev holds >20%).`);
+    if (!tx || !tx.meta) {
+      isTrading = false;
       return;
     }
 
+    const postTokenBalances = tx.meta.postTokenBalances || [];
     const newMint = postTokenBalances.find(b => b.mint !== SOL_MINT)?.mint;
-    if (!newMint) return;
+    if (!newMint) {
+      isTrading = false;
+      return;
+    }
 
-    console.log(`🎯 [Target Acquired] Token Mint: ${newMint}`);
+    // Metadata Filter Check
+    try {
+      const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (coinRes.ok) {
+        const coinData = await coinRes.json();
+        if (!coinData.description || coinData.description.length < 5) {
+          console.log(`🚫 [Safety Filter] Skipped spam token.`);
+          isTrading = false;
+          return;
+        }
+      }
+    } catch (e) {}
+
+    // 20% Position Sizing
+    const ALLOCATION_PERCENTAGE = 0.20; 
+    const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
+    const amountLamports = Math.floor(solToAllocate * 1e9);
+
+    console.log(`🎯 [Target Passed] Token Mint: ${newMint}`);
     console.log(`🚀 [Snipe Buying] Spending 20% (${solToAllocate.toFixed(4)} SOL)...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [SNIPE EXECUTED!] Solscan: https://solscan.io/tx/${txid}`);
 
+    setTimeout(async () => {
+      try {
+        const tokenAccountsRes = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: newMint });
+        const tokenUnits = tokenAccountsRes.value[0]?.account?.data?.parsed?.info?.tokenAmount?.amount;
+        if (tokenUnits) {
+          monitorAndExit(newMint, tokenUnits);
+        } else {
+          isTrading = false;
+        }
+      } catch (err) {
+        isTrading = false;
+      }
+    }, 4000);
+
   } catch (err) {
     console.error(`❌ Snipe Execution Error: ${err.message}`);
-  } finally {
     isTrading = false;
   }
 }
 
 function startListener() {
-  console.log("⚡ [Pump.fun Sniper Engine] Connecting to real-time stream...");
+  console.log("⚡ [Smart Sniper + 8% Trailing Exit Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Listening for fresh Pump.fun token launches...");
+    console.log("🟢 [Connected] Scanning and managing trades with 8% trailing exit...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -128,9 +190,7 @@ function startListener() {
         console.log(`\n🚨 [NEW LAUNCH DETECTED] Signature: ${signature.slice(0, 8)}...`);
         await handleSnipe(signature);
       }
-    } catch (e) {
-      console.error("⚠️ Stream error:", e.message);
-    }
+    } catch (e) {}
   });
 
   ws.on('close', () => {
@@ -138,9 +198,7 @@ function startListener() {
     setTimeout(startListener, 3000);
   });
 
-  ws.on('error', (err) => {
-    console.error("❌ WebSocket Error:", err.message);
-  });
+  ws.on('error', (err) => {});
 }
 
 startListener();
