@@ -17,7 +17,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Volume Velocity Rider Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Early-Catch Rider Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -59,7 +59,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
   
   let peakValue = initialSolSpent;
   const startTime = Date.now();
-  const maxHoldTimeMs = 4 * 60 * 1000;
+  const maxHoldTimeMs = 3 * 60 * 1000;
 
   const checkInterval = setInterval(async () => {
     try {
@@ -77,8 +77,8 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
 
       console.log(`📈 [Wave Check] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
 
-      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.02) && currentValueSol < peakValue * 0.90;
-      const hitStopLoss = currentValueSol <= initialSolSpent * 0.92;
+      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.015) && currentValueSol < peakValue * 0.92;
+      const hitStopLoss = currentValueSol <= initialSolSpent * 0.93;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pulledBackFromPeak || hitStopLoss || timedOut) {
@@ -89,7 +89,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         console.log(`✅ [POSITION CLOSED] Solscan: https://solscan.io/tx/${sellTxid}`);
         
         isTrading = false;
-        console.log(`🔄 [Status] Bot unlocked and ready for the next clean coin.`);
+        console.log(`🔄 [Status] Bot unlocked and ready for the next coin.`);
       }
     } catch (e) {}
   }, 4000);
@@ -118,78 +118,58 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // --- STEP 1: METADATA & SOCIAL CHECK ---
+    // --- BASIC METADATA CHECK ---
     try {
       const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (coinRes.ok) {
         const coinData = await coinRes.json();
-        const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
-        const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
-
-        if (!coinData.description || coinData.description.length < 5 || (!hasTwitter && !hasTelegram)) {
-          console.log(`🚫 [Filter] Skipped token lacking description/socials.`);
-          isTrading = false;
-          return;
-        }
-      }
-    } catch (e) {
-      isTrading = false;
-      return;
-    }
-
-    // --- STEP 2: EXPONENTIAL VOLUME VELOCITY CHECK (T0 -> T5 -> T15) ---
-    console.log(`⏳ [Volume Engine] Sampling velocity for ${newMint.slice(0, 8)}...`);
-
-    let solAtT0 = 0;
-    let solAtT5 = 0;
-    let solAtT15 = 0;
-
-    try {
-      const res0 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (res0.ok) solAtT0 = (await res0.json()).virtual_sol_reserves || 0;
-    } catch (e) {}
-
-    await new Promise(resolve => setTimeout(resolve, 5000));
-    try {
-      const res5 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (res5.ok) solAtT5 = (await res5.json()).virtual_sol_reserves || 0;
-    } catch (e) {}
-
-    await new Promise(resolve => setTimeout(resolve, 10000));
-    try {
-      const res15 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (res15.ok) {
-        const data15 = await res15.json();
-        solAtT15 = data15.virtual_sol_reserves || 0;
-        
-        if (data15.complete) {
-          console.log(`🚫 [Volume Filter] Curve completed during check. Skipping.`);
+        // Light check: just ensure it has a description or name, don't strictly require socials if they take too long to index
+        if (!coinData.name) {
           isTrading = false;
           return;
         }
       }
     } catch (e) {}
 
-    const initialGrowthSol = (solAtT5 - solAtT0) / 1e9;
-    const secondaryGrowthSol = (solAtT15 - solAtT5) / 1e9;
-    const totalGrowthSol = (solAtT15 - solAtT0) / 1e9;
+    // --- QUICK 8-SECOND GROWTH CHECK ---
+    console.log(`⏳ [Quick Check] Sampling volume for 8s on ${newMint.slice(0, 8)}...`);
 
-    console.log(`📊 [Volume Stats] T0->T5: +${initialGrowthSol.toFixed(2)} SOL | T5->T15: +${secondaryGrowthSol.toFixed(2)} SOL | Total: +${totalGrowthSol.toFixed(2)} SOL`);
+    let initialReserves = 0;
+    try {
+      const initRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (initRes.ok) initialReserves = (await initRes.json()).virtual_sol_reserves || 0;
+    } catch (e) {}
 
-    const MIN_REQUIRED_GROWTH = 2.0; // Lowered slightly to ensure catches while filtering out dead tokens
-    const isAccelerating = secondaryGrowthSol >= (initialGrowthSol * 0.8);
+    await new Promise(resolve => setTimeout(resolve, 8000));
 
-    if (totalGrowthSol < MIN_REQUIRED_GROWTH || !isAccelerating) {
-      console.log(`🚫 [Velocity Failed] Insufficient growth or momentum slowing down. Skipping.`);
+    let currentReserves = initialReserves;
+    try {
+      const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        if (checkData.complete) {
+          isTrading = false;
+          return;
+        }
+        currentReserves = checkData.virtual_sol_reserves || 0;
+      }
+    } catch (e) {}
+
+    const growthSol = (currentReserves - initialReserves) / 1e9;
+    console.log(`📊 [Growth Check] 8s Growth: +${growthSol.toFixed(2)} SOL`);
+
+    // Relaxed rule: As long as reserves didn't drop and gained at least 0.3 SOL, take the trade
+    if (growthSol < 0.3) {
+      console.log(`🚫 [Skipped] Growth too low (+${growthSol.toFixed(2)} SOL). Searching next...`);
       isTrading = false;
       return;
     }
 
-    // --- STEP 3: SINGLE-WALLET ALLOCATION ---
+    // --- ALLOCATE FULL WALLET ---
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Green Wave Confirmed] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
+    console.log(`🎯 [Target Acquired] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -214,11 +194,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Volume Velocity Rider Engine] Connecting...");
+  console.log("🌊 [Early-Catch Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for accelerating volume waves...");
+    console.log("🟢 [Connected] Scanning with relaxed filters for faster entries...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
