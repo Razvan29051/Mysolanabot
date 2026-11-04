@@ -16,7 +16,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Direct Stream Sniper Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Graduation Rider Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -24,13 +24,20 @@ try {
 
 let isTrading = false;
 const processedTokens = new Set();
+let lastRequestTime = 0;
 
 async function safeFetch(url, options = {}) {
+  const now = Date.now();
+  if (now - lastRequestTime < 300) {
+    await new Promise(resolve => setTimeout(resolve, 300 - (now - lastRequestTime)));
+  }
+  lastRequestTime = Date.now();
+
   for (let i = 0; i < 3; i++) {
     try {
       const res = await fetch(url, options);
       if (res.status === 429) {
-        await new Promise(resolve => setTimeout(resolve, 1500 * (i + 1)));
+        await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
         continue;
       }
       return res;
@@ -70,11 +77,11 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
 }
 
 async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
-  console.log(`👀 [Position Manager] Riding wave for ${tokenMint.slice(0, 8)}...`);
+  console.log(`👀 [Position Manager] Tracking graduating token ${tokenMint.slice(0, 8)}...`);
   
   let peakValue = initialSolSpent;
   const startTime = Date.now();
-  const maxHoldTimeMs = 4 * 60 * 1000;
+  const maxHoldTimeMs = 6 * 60 * 1000; // Longer hold for migrated tokens
 
   const checkInterval = setInterval(async () => {
     try {
@@ -87,10 +94,10 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
       const currentValueSol = parseInt(quote.outAmount) / 1e9;
       if (currentValueSol > peakValue) peakValue = currentValueSol;
 
-      console.log(`📈 [Wave Check] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
+      console.log(`📈 [Migration Track] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
 
-      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.02) && currentValueSol < peakValue * 0.90;
-      const hitStopLoss = currentValueSol <= initialSolSpent * 0.92;
+      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.03) && currentValueSol < peakValue * 0.88;
+      const hitStopLoss = currentValueSol <= initialSolSpent * 0.90;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pulledBackFromPeak || hitStopLoss || timedOut) {
@@ -101,13 +108,13 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         console.log(`✅ [POSITION CLOSED] Solscan: https://solscan.io/tx/${sellTxid}`);
         
         isTrading = false;
-        console.log(`🔄 [Status] Wallet unlocked for next setup.`);
+        console.log(`🔄 [Status] Wallet unlocked for next graduating target.`);
       }
     } catch (e) {}
   }, 6000);
 }
 
-async function handleSnipe(signature) {
+async function handleGraduationCandidate(signature) {
   try {
     const balanceLamports = await connection.getBalance(wallet.publicKey);
     const balanceSol = balanceLamports / 1e9;
@@ -131,43 +138,36 @@ async function handleSnipe(signature) {
     }
 
     processedTokens.add(newMint);
-    console.log(`⚡ [Target Found] Mint: ${newMint}`);
 
-    // 8-Second Volume Acceleration Check
-    let solAtT0 = 0;
-    try {
-      const res0 = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (res0.ok) solAtT0 = (await res0.json()).virtual_sol_reserves || 0;
-    } catch (e) {}
-
-    await new Promise(resolve => setTimeout(resolve, 8000));
-
-    let solAtT8 = solAtT0;
-    try {
-      const res8 = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (res8.ok) {
-        const data8 = await res8.json();
-        if (data8.complete) {
-          isTrading = false;
-          return;
-        }
-        solAtT8 = data8.virtual_sol_reserves || 0;
-      }
-    } catch (e) {}
-
-    const growthSol = (solAtT8 - solAtT0) / 1e9;
-    console.log(`📊 [Volume Stats] 8s Growth: +${growthSol.toFixed(2)} SOL`);
-
-    if (growthSol < 0.2) {
-      console.log(`🚫 [Skipped] Insufficient volume momentum (+${growthSol.toFixed(2)} SOL).`);
+    // Check bonding curve state to see how close it is to graduation
+    const coinRes = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+    if (!coinRes.ok) {
       isTrading = false;
       return;
     }
 
+    const coinData = await coinRes.json();
+    if (coinData.complete) {
+      isTrading = false;
+      return;
+    }
+
+    const virtualSol = coinData.virtual_sol_reserves || 0;
+    // Pump.fun curves graduate around 85+ SOL reserves roughly
+    const graduationProgress = (virtualSol / 85000000000) * 100;
+
+    console.log(`🔍 [Curve Check] Token ${newMint.slice(0, 8)} Progress: ${graduationProgress.toFixed(1)}%`);
+
+    // Only target tokens that are past 75% graduation progress
+    if (graduationProgress < 75) {
+      isTrading = false;
+      return;
+    }
+
+    console.log(`🎯 [Graduation Target Found!] Entering near completion phase...`);
+
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
-
-    console.log(`🎯 [Execution] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -192,11 +192,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Direct Stream Engine] Connecting...");
+  console.log("🌊 [Graduation Stream Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Listening to Pump.fun program stream...");
+    console.log("🟢 [Connected] Scanning for high-progress bonding curves...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -218,17 +218,15 @@ function startListener() {
       const logs = payload.params.result.value.logs || [];
       const signature = payload.params.result.value.signature;
 
-      // Match any log line associated with token creation or initialization
-      const isCreateEvent = logs.some(log => 
-        log.includes("Program log: Instruction: Initialize") ||
-        log.includes("Program log: Instruction: Create") ||
-        log.includes("initialize") ||
-        log.includes("create")
+      // Listen for buy/trade events or updates rather than just raw creates
+      const isTradeEvent = logs.some(log => 
+        log.toLowerCase().includes("instruction: buy") || 
+        log.toLowerCase().includes("trade")
       );
 
-      if (isCreateEvent) {
+      if (isTradeEvent) {
         isTrading = true;
-        await handleSnipe(signature);
+        await handleGraduationCandidate(signature);
       }
     } catch (e) {}
   });
