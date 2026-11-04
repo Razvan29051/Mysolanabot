@@ -1,9 +1,10 @@
 {
   "name": "solana-bot",
   "version": "1.0.0",
-  "type": "module",
+  "type": "commonjs",
   "dependencies": {
-    "@solana/web3.js": "^1.95.0",
+    "@solana/web3.js": "1.98.0",
+    "rpc-websockets": "7.11.1",
     "bs58": "^5.0.0",
     "cross-fetch": "^4.0.0"
   }
