@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { Connection, Keypair, VersionedTransaction, PublicKey } from '@solana/web3.js';
+import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import fetch from 'cross-fetch';
 
@@ -58,16 +58,18 @@ async function handleSnipe(signature) {
     const balanceLamports = await connection.getBalance(wallet.publicKey);
     const balanceSol = balanceLamports / 1e9;
     
-    if (balanceSol < 0.05) {
-      console.log(`⚠️ Balance too low (${balanceSol.toFixed(4)} SOL). Reserving gas.`);
+    if (balanceSol < 0.015) {
+      console.log(`⚠️ Balance too low (${balanceSol.toFixed(4)} SOL). Minimum required is 0.015 SOL.`);
       return;
     }
 
-    // Allocate 50% of available SOL balance
-    const solToAllocate = Math.max(0.01, (balanceSol - 0.03) * 0.50);
+    // --- POSITION SIZING ---
+    // Configured for 20% allocation of available SOL balance (reserving 0.005 SOL for network fees)
+    const ALLOCATION_PERCENTAGE = 0.20; 
+    const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
+
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    // FIX: Set maxSupportedTransactionVersion to 1 to handle modern v0/v1 transactions
     const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 1 });
     if (!tx || !tx.meta) return;
 
@@ -84,7 +86,7 @@ async function handleSnipe(signature) {
     if (!newMint) return;
 
     console.log(`🎯 [Target Acquired] Token Mint: ${newMint}`);
-    console.log(`🚀 [Snipe Buying] Spending 50% (${solToAllocate.toFixed(4)} SOL)...`);
+    console.log(`🚀 [Snipe Buying] Spending 20% (${solToAllocate.toFixed(4)} SOL)...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [SNIPE EXECUTED!] Solscan: https://solscan.io/tx/${txid}`);
