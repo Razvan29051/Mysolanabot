@@ -3,7 +3,19 @@ import bs58 from 'bs58';
 import fetch from 'cross-fetch';
 
 const connection = new Connection(process.env.RPC_URL, 'confirmed');
-const wallet = Keypair.fromSecretKey(bs58.decode(process.env.BOT_PRIVATE_KEY));
+
+// Bulletproof key loader (handles both base58 strings and number arrays)
+let secretKey;
+try {
+  if (process.env.BOT_PRIVATE_KEY.trim().startsWith('[')) {
+    secretKey = Uint8Array.from(JSON.parse(process.env.BOT_PRIVATE_Key || process.env.BOT_PRIVATE_KEY));
+  } else {
+    secretKey = bs58.decode(process.env.BOT_PRIVATE_KEY.trim());
+  }
+} catch (e) {
+  secretKey = bs58.decode(process.env.BOT_PRIVATE_KEY.trim());
+}
+const wallet = Keypair.fromSecretKey(secretKey);
 
 async function runAutoTrade() {
   console.log(`🤖 Bot Active | Executing for Wallet: ${wallet.publicKey.toString()}`);
