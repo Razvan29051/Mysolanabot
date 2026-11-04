@@ -16,7 +16,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Production Sniper Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Throttled Sniper Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -24,24 +24,30 @@ try {
 
 let isTrading = false;
 const processedTokens = new Set();
+let lastRequestTime = 0;
 
-// Robust fetch with smooth rate-limit pacing
-async function safeFetch(url, options = {}, retries = 4, delay = 1500) {
-  for (let i = 0; i < retries; i++) {
+// Rate-limited fetch to completely prevent 429 floods
+async function safeFetch(url, options = {}) {
+  const now = Date.now();
+  const timeSinceLastRequest = now - lastRequestTime;
+  if (timeSinceLastRequest < 300) {
+    await new Promise(resolve => setTimeout(resolve, 300 - timeSinceLastRequest));
+  }
+  lastRequestTime = Date.now();
+
+  for (let i = 0; i < 3; i++) {
     try {
       const res = await fetch(url, options);
       if (res.status === 429) {
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 1.5;
+        await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
         continue;
       }
       return res;
     } catch (err) {
-      if (i === retries - 1) throw err;
-      await new Promise(resolve => setTimeout(resolve, delay));
+      if (i === 2) throw err;
     }
   }
-  throw new Error("Max retries reached.");
+  throw new Error("Rate limit exceeded.");
 }
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
@@ -70,23 +76,6 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   transaction.sign([wallet]);
 
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
-}
-
-async function checkTokenMetadata(tokenMint) {
-  try {
-    const coinRes = await safeFetch(`https://frontend-api.pump.fun/coins/${tokenMint}`);
-    if (!coinRes.ok) return false;
-
-    const coinData = await coinRes.json();
-    const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
-    const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
-    const hasDescription = coinData.description && coinData.description.length > 3;
-
-    if (!hasDescription || (!hasTwitter && !hasTelegram)) return false;
-    return true;
-  } catch (err) {
-    return false;
-  }
 }
 
 async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
@@ -127,7 +116,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         console.log(`🔄 [Status] Wallet unlocked for next clean setup.`);
       }
     } catch (e) {}
-  }, 5000);
+  }, 6000);
 }
 
 async function handleSnipe(signature) {
@@ -154,16 +143,8 @@ async function handleSnipe(signature) {
     }
 
     processedTokens.add(newMint);
-    console.log(`⚡ [Validated Target] Address: ${newMint}`);
 
-    const metadataOk = await checkTokenMetadata(newMint);
-    if (!metadataOk) {
-      console.log(`🚫 [Skipped] Token lacks proper social metadata.`);
-      isTrading = false;
-      return;
-    }
-
-    console.log(`⏳ [Volume Engine] Sampling reserves for ${newMint.slice(0, 8)}...`);
+    // Quick volume check with built-in pacing
     let solAtT0 = 0;
     try {
       const res0 = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
@@ -186,18 +167,15 @@ async function handleSnipe(signature) {
     } catch (e) {}
 
     const growthSol = (solAtT8 - solAtT0) / 1e9;
-    console.log(`📊 [Volume Stats] Net Growth: +${growthSol.toFixed(2)} SOL`);
-
     if (growthSol < 0.2) {
-      console.log(`🚫 [Skipped] Insufficient volume growth (+${growthSol.toFixed(2)} SOL).`);
       isTrading = false;
       return;
     }
 
+    console.log(`🎯 [Green Wave Found] Target: ${newMint.slice(0, 8)} | Growth: +${growthSol.toFixed(2)} SOL`);
+
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
-
-    console.log(`🎯 [Execution] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -222,11 +200,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Production Wave Engine] Connecting...");
+  console.log("🌊 [Throttled Wave Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for live green waves...");
+    console.log("🟢 [Connected] Scanning cleanly without rate spikes...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
