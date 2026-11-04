@@ -53,13 +53,13 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Monitor and sell on green spikes or 8% trailing pullbacks
+// Safe monitor and exit loop
 async function monitorAndExit(tokenMint, buyAmountUnits) {
   console.log(`👀 [Position Manager] Tracking price action for ${tokenMint.slice(0, 8)}...`);
   
   let peakValue = 0;
   const startTime = Date.now();
-  const maxHoldTimeMs = 3 * 60 * 1000; // Max hold 3 minutes
+  const maxHoldTimeMs = 3 * 60 * 1000;
 
   const checkInterval = setInterval(async () => {
     try {
@@ -74,20 +74,19 @@ async function monitorAndExit(tokenMint, buyAmountUnits) {
 
       console.log(`📈 [Price Check] Current Value: ${currentValueSol.toFixed(4)} SOL (Peak: ${peakValue.toFixed(4)} SOL)`);
 
-      // Exit Condition: Trigger sell if price drops 8% from its peak green high
       const pulledBackFromPeak = peakValue > 0.005 && currentValueSol < peakValue * 0.92;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pulledBackFromPeak || timedOut) {
         clearInterval(checkInterval);
-        console.log(`🚨 [Exit Triggered] Selling token (8% pullback from peak reached)...`);
+        console.log(`🚨 [Exit Triggered] Selling token (8% pullback or timeout reached)...`);
         
         const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
         console.log(`✅ [SOLD!] Solscan: https://solscan.io/tx/${sellTxid}`);
         isTrading = false;
       }
     } catch (e) {
-      // Ignore transient network errors
+      // Safe ignore for polling network blips
     }
   }, 5000);
 }
@@ -98,7 +97,7 @@ async function handleSnipe(signature) {
     const balanceSol = balanceLamports / 1e9;
     
     if (balanceSol < 0.015) {
-      console.log(`⚠️ Balance too low (${balanceSol.toFixed(4)} SOL). Minimum required is 0.015 SOL.`);
+      console.log(`⚠️ Balance too low (${balanceSol.toFixed(4)} SOL).`);
       isTrading = false;
       return;
     }
@@ -140,6 +139,7 @@ async function handleSnipe(signature) {
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [SNIPE EXECUTED!] Solscan: https://solscan.io/tx/${txid}`);
 
+    // Safely lookup token balance for exit manager without crashing
     setTimeout(async () => {
       try {
         const tokenAccountsRes = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: newMint });
@@ -147,12 +147,14 @@ async function handleSnipe(signature) {
         if (tokenUnits) {
           monitorAndExit(newMint, tokenUnits);
         } else {
+          console.log(`⚠️ Could not verify token balance units for auto-exit. Resetting trading lock.`);
           isTrading = false;
         }
       } catch (err) {
+        console.error(`⚠️ Exit manager lookup error: ${err.message}`);
         isTrading = false;
       }
-    }, 4000);
+    }, 5000);
 
   } catch (err) {
     console.error(`❌ Snipe Execution Error: ${err.message}`);
@@ -161,11 +163,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("⚡ [Smart Sniper + 8% Trailing Exit Engine] Connecting...");
+  console.log("⚡ [Smart Sniper + Hardened Exit Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning and managing trades with 8% trailing exit...");
+    console.log("🟢 [Connected] Active and stable 24/7 listener running...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
