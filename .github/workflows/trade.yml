@@ -1,8 +1,8 @@
 name: Free Autonomous Scalper Loop
 on:
-  workflow_dispatch: # Lets you trigger a real trade manually anytime from your phone
+  workflow_dispatch:
   schedule:
-    - cron: '*/15 * * * *' # Runs automatically every 15 minutes 24/7 for FREE
+    - cron: '*/15 * * * *'
 
 jobs:
   trade:
@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-node@v3
         with:
           node-version: '18'
-      - run: npm install @solana/web3.js bs58 cross-fetch
+      - run: npm install
       - run: node bot.js
         env:
           BOT_PRIVATE_KEY: ${{ secrets.BOT_PRIVATE_KEY }}
