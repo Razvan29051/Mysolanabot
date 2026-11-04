@@ -53,7 +53,7 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Safe monitor and exit loop
+// Position Manager with 8% trailing exit
 async function monitorAndExit(tokenMint, buyAmountUnits) {
   console.log(`👀 [Position Manager] Tracking price action for ${tokenMint.slice(0, 8)}...`);
   
@@ -85,9 +85,7 @@ async function monitorAndExit(tokenMint, buyAmountUnits) {
         console.log(`✅ [SOLD!] Solscan: https://solscan.io/tx/${sellTxid}`);
         isTrading = false;
       }
-    } catch (e) {
-      // Safe ignore for polling network blips
-    }
+    } catch (e) {}
   }, 5000);
 }
 
@@ -128,18 +126,35 @@ async function handleSnipe(signature) {
       }
     } catch (e) {}
 
+    // --- LAUNCH DELAY FILTER ---
+    console.log(`⏳ [Launch Delay] Waiting 15 seconds to let initial sniper dump clear for ${newMint.slice(0, 8)}...`);
+    await new Promise(resolve => setTimeout(resolve, 15000));
+
+    // Re-check price/market cap via API to ensure it hasn't crashed to zero during the 15s wait
+    try {
+      const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        // If bonding curve progress or replies dropped dead, skip it
+        if (checkData.complete || checkData.virtual_sol_reserves < 3500000000) { // basic viability check
+          console.log(`🚫 [Delay Filter] Token lost momentum during 15s wait. Skipping.`);
+          isTrading = false;
+          return;
+        }
+      }
+    } catch (e) {}
+
     // 20% Position Sizing
     const ALLOCATION_PERCENTAGE = 0.20; 
     const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Target Passed] Token Mint: ${newMint}`);
+    console.log(`🎯 [Target Survived Delay] Token Mint: ${newMint}`);
     console.log(`🚀 [Snipe Buying] Spending 20% (${solToAllocate.toFixed(4)} SOL)...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [SNIPE EXECUTED!] Solscan: https://solscan.io/tx/${txid}`);
 
-    // Safely lookup token balance for exit manager without crashing
     setTimeout(async () => {
       try {
         const tokenAccountsRes = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: newMint });
@@ -147,11 +162,10 @@ async function handleSnipe(signature) {
         if (tokenUnits) {
           monitorAndExit(newMint, tokenUnits);
         } else {
-          console.log(`⚠️ Could not verify token balance units for auto-exit. Resetting trading lock.`);
+          console.log(`⚠️ Could not verify token balance units. Resetting trading lock.`);
           isTrading = false;
         }
       } catch (err) {
-        console.error(`⚠️ Exit manager lookup error: ${err.message}`);
         isTrading = false;
       }
     }, 5000);
@@ -163,11 +177,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("⚡ [Smart Sniper + Hardened Exit Engine] Connecting...");
+  console.log("⚡ [Smart Sniper + 15s Launch Delay Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Active and stable 24/7 listener running...");
+    console.log("🟢 [Connected] Listening and filtering with delay...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
