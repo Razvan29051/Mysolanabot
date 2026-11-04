@@ -16,7 +16,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Throttled Sniper Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Direct Stream Sniper Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -24,22 +24,13 @@ try {
 
 let isTrading = false;
 const processedTokens = new Set();
-let lastRequestTime = 0;
 
-// Rate-limited fetch to completely prevent 429 floods
 async function safeFetch(url, options = {}) {
-  const now = Date.now();
-  const timeSinceLastRequest = now - lastRequestTime;
-  if (timeSinceLastRequest < 300) {
-    await new Promise(resolve => setTimeout(resolve, 300 - timeSinceLastRequest));
-  }
-  lastRequestTime = Date.now();
-
   for (let i = 0; i < 3; i++) {
     try {
       const res = await fetch(url, options);
       if (res.status === 429) {
-        await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
+        await new Promise(resolve => setTimeout(resolve, 1500 * (i + 1)));
         continue;
       }
       return res;
@@ -47,7 +38,7 @@ async function safeFetch(url, options = {}) {
       if (i === 2) throw err;
     }
   }
-  throw new Error("Rate limit exceeded.");
+  throw new Error("Request failed.");
 }
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
@@ -94,10 +85,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
       if (!quote || quote.error) return;
 
       const currentValueSol = parseInt(quote.outAmount) / 1e9;
-      
-      if (currentValueSol > peakValue) {
-        peakValue = currentValueSol;
-      }
+      if (currentValueSol > peakValue) peakValue = currentValueSol;
 
       console.log(`📈 [Wave Check] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
 
@@ -113,7 +101,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         console.log(`✅ [POSITION CLOSED] Solscan: https://solscan.io/tx/${sellTxid}`);
         
         isTrading = false;
-        console.log(`🔄 [Status] Wallet unlocked for next clean setup.`);
+        console.log(`🔄 [Status] Wallet unlocked for next setup.`);
       }
     } catch (e) {}
   }, 6000);
@@ -143,8 +131,9 @@ async function handleSnipe(signature) {
     }
 
     processedTokens.add(newMint);
+    console.log(`⚡ [Target Found] Mint: ${newMint}`);
 
-    // Quick volume check with built-in pacing
+    // 8-Second Volume Acceleration Check
     let solAtT0 = 0;
     try {
       const res0 = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
@@ -167,15 +156,18 @@ async function handleSnipe(signature) {
     } catch (e) {}
 
     const growthSol = (solAtT8 - solAtT0) / 1e9;
+    console.log(`📊 [Volume Stats] 8s Growth: +${growthSol.toFixed(2)} SOL`);
+
     if (growthSol < 0.2) {
+      console.log(`🚫 [Skipped] Insufficient volume momentum (+${growthSol.toFixed(2)} SOL).`);
       isTrading = false;
       return;
     }
 
-    console.log(`🎯 [Green Wave Found] Target: ${newMint.slice(0, 8)} | Growth: +${growthSol.toFixed(2)} SOL`);
-
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
+
+    console.log(`🎯 [Execution] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -200,11 +192,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Throttled Wave Engine] Connecting...");
+  console.log("🌊 [Direct Stream Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning cleanly without rate spikes...");
+    console.log("🟢 [Connected] Listening to Pump.fun program stream...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -226,10 +218,12 @@ function startListener() {
       const logs = payload.params.result.value.logs || [];
       const signature = payload.params.result.value.signature;
 
+      // Match any log line associated with token creation or initialization
       const isCreateEvent = logs.some(log => 
-        log.toLowerCase().includes("instruction: create") || 
-        log.toLowerCase().includes("initialize") ||
-        log.toLowerCase().includes("create")
+        log.includes("Program log: Instruction: Initialize") ||
+        log.includes("Program log: Instruction: Create") ||
+        log.includes("initialize") ||
+        log.includes("create")
       );
 
       if (isCreateEvent) {
