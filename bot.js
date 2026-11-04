@@ -20,14 +20,13 @@ try {
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const DEFAULT_TARGET_MINT = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm'; // WIF
-const TRADE_ALLOC_SOL = 0.02; // Amount of SOL to allocate per trade
+const TRADE_ALLOC_SOL = 0.02; // Amount of SOL to spend on a buy
 
-async function executeSwap(inputMint, outputMint, amountLamports) {
-  console.log(`🔄 [Executor] Requesting new Jupiter V1 quote endpoint...`);
+async function executeSwap(inputMint, outputMint, amountUnits) {
+  console.log(`🔄 [Executor] Requesting Jupiter quote (${inputMint} -> ${outputMint})...`);
   
-  // Updated to the current active Jupiter V1 API endpoint
   const quoteRes = await fetch(
-    `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=150`
+    `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountUnits}&slippageBps=200`
   );
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Jupiter Quote Error: ${quote.error}`);
@@ -84,18 +83,32 @@ async function runScalperCycle() {
     }
 
     if (activeTokenAccount) {
-      console.log(`📊 [Position Active] Found holding for token: ${tokenMint} (Balance: ${tokenBalance})`);
+      console.log(`📊 [Position Active] Found token holding: ${tokenMint} (Balance: ${tokenBalance})`);
 
+      // Check current value in SOL via Jupiter Quote
       const quoteRes = await fetch(
-        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${tokenAmountRaw}&slippageBps=150`
+        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${tokenAmountRaw}&slippageBps=200`
       );
       const quote = await quoteRes.json();
       
       if (quote.outAmount) {
         const currentSolVal = quote.outAmount / 1e9;
-        console.log(`💡 [Analyst] Estimated liquidation value: ${currentSolVal.toFixed(4)} SOL`);
+        console.log(`💡 [Analyst] Current estimated liquidation value: ${currentSolVal.toFixed(4)} SOL`);
+        
+        // AUTOMATIC EXIT CONDITION: 
+        // For demonstration, if you want it to sell back to SOL right now when testing, 
+        // or you can set a rule (e.g. target profit or stop-loss trigger).
+        // To force a sell on this run, set FORCE_SELL to true. If false, it holds and monitors:
+        const FORCE_SELL = false; 
+
+        if (FORCE_SELL) {
+          console.log(`🚨 [Risk Engine] Exit condition met! Selling token back to SOL...`);
+          const txid = await executeSwap(tokenMint, SOL_MINT, tokenAmountRaw);
+          console.log(`✅ [Executor] SELL COMPLETE! Solscan: https://solscan.io/tx/${txid}`);
+          return;
+        }
       }
-      console.log(`🛡️ [Risk Engine] Position active. Monitoring trailing targets...`);
+      console.log(`🛡️ [Risk Engine] Holding position... tracking market waves.`);
 
     } else {
       if (balanceSol < TRADE_ALLOC_SOL + 0.005) {
@@ -103,7 +116,7 @@ async function runScalperCycle() {
         return;
       }
 
-      console.log(`🎯 [Scout] High-momentum token scanned. Executing buy order...`);
+      console.log(`🎯 [Scout] No tokens held. Executing buy order...`);
       const buyAmountLamports = Math.floor(TRADE_ALLOC_SOL * 1e9);
       const txid = await executeSwap(SOL_MINT, DEFAULT_TARGET_MINT, buyAmountLamports);
       
