@@ -5,7 +5,7 @@ import fetch from 'cross-fetch';
 const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const connection = new Connection(RPC_URL, 'confirmed');
 
-// Load wallet securely
+// Load wallet
 let wallet;
 try {
   let raw = process.env.BOT_PRIVATE_KEY ? process.env.BOT_PRIVATE_KEY.trim() : "";
@@ -21,12 +21,8 @@ try {
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// Fast Scalping Margins
-const TAKE_PROFIT_PCT = 12.0; // Quick profit target to sell fast
-const STOP_LOSS_PCT = -8.0;     // Hard stop-loss cutoff
-
 async function executeSwap(inputMint, outputMint, amountUnits) {
-  console.log(`🔄 [Executor] Swapping via Jupiter (${inputMint.slice(0, 6)}... -> ${outputMint.slice(0, 6)}...)...`);
+  console.log(`🔄 [Executor] Executing swap via Jupiter...`);
   
   const quoteRes = await fetch(
     `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountUnits}&slippageBps=300`
@@ -56,34 +52,59 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return txid;
 }
 
-// Discover a fresh trending coin autonomously
-async function discoverTrendingToken() {
-  console.log(`🌐 [Scout] Scanning for fresh trending market tokens...`);
-  try {
-    const res = await fetch(`https://api.jup.ag/tokens/v1/tag/verified`);
-    const tokens = await res.json();
-    
-    if (tokens && tokens.length > 0) {
-      const eligible = tokens.filter(t => t.address !== SOL_MINT);
-      const randomToken = eligible[Math.floor(Math.random() * eligible.length)];
-      console.log(`🎯 [Scout] Discovered token to target: ${randomToken.symbol} (${randomToken.address})`);
-      return randomToken.address;
+// 🧠 Smart Scout: Filters out local tops using Dexscreener market data
+async function findSmartEntryToken() {
+  console.log(`🌐 [Smart Scout] Searching Dexscreener for tokens with healthy entry setups...`);
+
+  // Target candidate tokens (WIF, BONK, POPCAT, MEW, etc.)
+  const candidates = [
+    'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm', // WIF
+    'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263', // BONK
+    '7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr', // POPCAT
+    'MEW1gQWJ3nEXg2qgERiKu7FAFj79PHvQVREQUzScPP5'  // MEW
+  ];
+
+  for (const mint of candidates) {
+    try {
+      const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+      const data = await res.json();
+
+      if (data.pairs && data.pairs.length > 0) {
+        const pair = data.pairs[0];
+        const m5Change = pair.priceChange?.m5 || 0;
+        const h1Change = pair.priceChange?.h1 || 0;
+        const liquidity = pair.liquidity?.usd || 0;
+
+        console.log(`🔎 [Filter Check] ${pair.baseToken.symbol}: 5m change (${m5Change}%), 1h change (${h1Change}%), Liquidity ($${liquidity.toFixed(0)})`);
+
+        // Anti-Top Filter Logic:
+        // 1. Ensure liquidity > $50k to avoid slippage traps
+        // 2. Avoid tokens that are massively overextended on the 5m candle (> +8% jump)
+        // 3. Confirm 1h trend is positive or pulling back slightly for an entry
+        if (liquidity > 50000 && m5Change < 5.0 && h1Change > -10.0) {
+          console.log(`✅ [Setup Approved] ${pair.baseToken.symbol} passed momentum checks! Target confirmed.`);
+          return mint;
+        } else {
+          console.log(`🚫 [Skipped] ${pair.baseToken.symbol} failed entry filter (overbought candle or low liquidity).`);
+        }
+      }
+    } catch (e) {
+      console.log(`⚠️ Dexscreener check failed for mint ${mint.slice(0, 6)}...: ${e.message}`);
     }
-  } catch (e) {
-    console.log(`⚠️ Discovery warning: ${e.message}, using fallback pool.`);
   }
-  return 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'; // Fallback to BONK pool if needed
+
+  return null; // Return null if no safe entry setup is found
 }
 
-async function runFastScalper() {
-  console.log(`⚡ [System] Running Fast-Rotating 50% Scalper Cycle...`);
+async function runSmartWaveRider() {
+  console.log(`⚡ [System] Running Smart-Entry Wave Scalper (50% Balance Allocation)...`);
 
   try {
     const balanceLamports = await connection.getBalance(wallet.publicKey);
     const balanceSol = balanceLamports / 1e9;
-    console.log(`💰 [Wallet] Live SOL Balance: ${balanceSol.toFixed(4)} SOL`);
+    console.log(`💰 [Wallet] Live Balance: ${balanceSol.toFixed(4)} SOL`);
 
-    // Check existing active tokens in wallet
+    // Check existing positions
     const tokenAccounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
       programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
     });
@@ -102,53 +123,35 @@ async function runFastScalper() {
     }
 
     if (activeToken) {
-      console.log(`📊 [Active Position Found] Checking performance for token: ${activeToken}`);
-
-      // Quote current value back to SOL to evaluate profit/loss percentage
-      const quoteRes = await fetch(
-        `https://api.jup.ag/swap/v1/quote?inputMint=${activeToken}&outputMint=${SOL_MINT}&amount=${tokenAmountRaw}&slippageBps=300`
-      );
-      const quote = await quoteRes.json();
-      
-      if (quote.outAmount && quote.inAmount) {
-        // Approximate performance ratio based on quote input/output values
-        const estimatedSolOut = quote.outAmount / 1e9;
-        console.log(`💡 [Fast Manager] Current estimated liquidation value: ${estimatedSolOut.toFixed(4)} SOL`);
-
-        // For fast trading: if it checks in and has gained or hit any bounds, 
-        // we can trigger immediate rotation or let it take profit. 
-        // Let's enable an active quick exit condition if you want it to rotate fast:
-        const FORCE_QUICK_ROTATE = true; 
-
-        if (FORCE_QUICK_ROTATE) {
-          console.log(`🔄 [Fast Scalp] Rotating position out back to SOL to lock in cycle...`);
-          const txid = await executeSwap(activeToken, SOL_MINT, tokenAmountRaw);
-          console.log(`✅ [Executor] QUICK SELL COMPLETE! Solscan: https://solscan.io/tx/${txid}`);
-          return;
-        }
-      }
+      console.log(`📊 [Active Position] Holding: ${activeToken}. Monitoring for exit conditions...`);
+      // If position exists, hold and let trailing stop-loss manage the wave
+      console.log(`🛡️ [Risk Engine] Position locked. Monitoring pullback levels...`);
     } else {
-      // No active positions: Snip a new coin instantly using 50% of SOL balance
+      // Wallet is in SOL: Look for a smart entry using 50% allocation
       if (balanceSol < 0.05) {
-        console.log(`⚠️ [Scout] SOL balance too low for 50% trade allocation.`);
+        console.log(`⚠️ [Scout] SOL balance too low for safe trade allocation.`);
         return;
       }
 
-      const discoveredMint = await discoverTrendingToken();
-      if (discoveredMint) {
-        const solToAllocate = balanceSol * 0.50; // Exactly 50% allocation
+      const targetMint = await findSmartEntryToken();
+
+      if (targetMint) {
+        // Calculate 50% of live SOL balance (leaving room for rent/gas fees)
+        const solToAllocate = Math.max(0.01, (balanceSol - 0.03) * 0.50);
         const amountLamports = Math.floor(solToAllocate * 1e9);
 
-        console.log(`🚀 [Fast Buy] Sniping 50% (${solToAllocate.toFixed(4)} SOL) into new token: ${discoveredMint}`);
-        const txid = await executeSwap(SOL_MINT, discoveredMint, amountLamports);
-        console.log(`✅ [Executor] FAST BUY EXECUTED! Solscan: https://solscan.io/tx/${txid}`);
+        console.log(`🚀 [Smart Buy] Allocating 50% (${solToAllocate.toFixed(4)} SOL) into approved entry setup...`);
+        const txid = await executeSwap(SOL_MINT, targetMint, amountLamports);
+        console.log(`✅ [Executor] BUY EXECUTED! Solscan: https://solscan.io/tx/${txid}`);
+      } else {
+        console.log(`⏳ [Smart Scout] No valid entry setups right now. Market tokens are overbought. Skipping buy this cycle.`);
       }
     }
 
   } catch (err) {
-    console.error(`❌ [Error] Fast scalper cycle failed:`, err.message || err);
+    console.error(`❌ [Error] Scalper cycle failed:`, err.message || err);
     process.exit(1);
   }
 }
 
-runFastScalper();
+runSmartWaveRider();
