@@ -17,7 +17,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Green Wave Rider Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Smart Filter Wave Rider Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -53,13 +53,13 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Wave Rider Position Manager: Rides massive green pumps with a trailing exit
+// Position Manager: Rides green waves with a trailing exit, cuts losses quickly if momentum fails
 async function monitorAndRideWave(tokenMint, buyAmountUnits, initialSolSpent) {
-  console.log(`👀 [Wave Rider] Tracking green momentum. Ready to ride high...`);
+  console.log(`👀 [Wave Rider] Tracking momentum...`);
   
   let peakValue = initialSolSpent;
   const startTime = Date.now();
-  const maxHoldTimeMs = 4 * 60 * 1000; // Allow up to 4 minutes to catch a massive wave
+  const maxHoldTimeMs = 3 * 60 * 1000;
 
   const checkInterval = setInterval(async () => {
     try {
@@ -71,38 +71,26 @@ async function monitorAndRideWave(tokenMint, buyAmountUnits, initialSolSpent) {
 
       const currentValueSol = parseInt(quote.outAmount) / 1e9;
       
-      // Update peak value dynamically as the token pumps higher and higher
       if (currentValueSol > peakValue) {
         peakValue = currentValueSol;
       }
 
-      console.log(`📈 [Wave Monitor] Current: ${currentValueSol.toFixed(4)} SOL | Peak Reached: ${peakValue.toFixed(4)} SOL`);
+      console.log(`📈 [Wave Monitor] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
 
-      // Exit Triggers:
-      // 1. Trailing Pullback: If it drops 10% from its highest peak green value, lock in profits
-      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.03) && currentValueSol < peakValue * 0.90;
-      // 2. Stop-Loss: If it instantly dumps straight down past -10% without ever pumping, cut losses
-      const hitStopLoss = currentValueSol <= initialSolSpent * 0.90;
-      // 3. Time limit reached
+      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.02) && currentValueSol < peakValue * 0.92;
+      const hitStopLoss = currentValueSol <= initialSolSpent * 0.93; // Tight 7% stop loss to prevent deep red
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pulledBackFromPeak || hitStopLoss || timedOut) {
         clearInterval(checkInterval);
-        
-        if (pulledBackFromPeak) {
-          console.log(`🟢 [Wave Peak Reached] Pullback detected from peak. Securing monster profits...`);
-        } else if (hitStopLoss) {
-          console.log(`🚨 [Stop Loss] Cutting position to protect wallet...`);
-        } else {
-          console.log(`⏰ [Timeout] Max hold duration reached. Exiting...`);
-        }
+        console.log(pulledBackFromPeak ? `🟢 [Profit Secured from Peak] Selling...` : `🚨 [Stop-Loss / Timeout] Cutting position...`);
         
         const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
-        console.log(`✅ [SOLD & SECURED!] Solscan: https://solscan.io/tx/${sellTxid}`);
+        console.log(`✅ [SOLD!] Solscan: https://solscan.io/tx/${sellTxid}`);
         isTrading = false;
       }
     } catch (e) {}
-  }, 4000); // Check every 4 seconds to track price action closely
+  }, 4000);
 }
 
 async function handleSnipe(signature) {
@@ -128,7 +116,7 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // --- METADATA & SOCIAL VERIFICATION ---
+    // --- INITIAL METADATA & SOCIAL CHECK ---
     try {
       const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (coinRes.ok) {
@@ -144,17 +132,37 @@ async function handleSnipe(signature) {
       }
     } catch (e) {}
 
-    // --- 15-SECOND LAUNCH DELAY ---
-    console.log(`⏳ [Delay Window] Waiting 15s to let initial sniper chaos clear for ${newMint.slice(0, 8)}...`);
+    // --- 15-SECOND MOMENTUM CHECK DELAY ---
+    console.log(`⏳ [Delay Window] Waiting 15s to check volume formation for ${newMint.slice(0, 8)}...`);
+    
+    // Check initial reserves right when detected
+    let initialReserves = 0;
+    try {
+      const initRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (initRes.ok) {
+        const initData = await initRes.json();
+        initialReserves = initData.virtual_sol_reserves || 0;
+      }
+    } catch (e) {}
+
     await new Promise(resolve => setTimeout(resolve, 15000));
 
-    // --- VOLUME SURVIVAL CHECK ---
+    // --- STRENGTH & ACCELERATION VALIDATION ---
     try {
       const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (checkRes.ok) {
         const checkData = await checkRes.json();
-        if (checkData.complete || (checkData.virtual_sol_reserves || 0) < 3200000000) {
-          console.log(`🚫 [Volume Filter] Token went flat or graduated during delay. Skipping.`);
+        if (checkData.complete) {
+          console.log(`🚫 [Filter] Token already completed bonding curve. Skipping.`);
+          isTrading = false;
+          return;
+        }
+
+        const currentReserves = checkData.virtual_sol_reserves || 0;
+        
+        // Ensure reserves actually *grew* during the 15 seconds (organic buyers stepping in)
+        if (currentReserves <= initialReserves) {
+          console.log(`🚫 [Momentum Filter] Volume flatlined or dumped during delay. Skipping.`);
           isTrading = false;
           return;
         }
@@ -166,7 +174,7 @@ async function handleSnipe(signature) {
     const solToAllocate = Math.max(0.003, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Wave Entry Approved] Buying with ${solToAllocate.toFixed(4)} SOL...`);
+    console.log(`🎯 [Momentum Confirmed] Buying with ${solToAllocate.toFixed(4)} SOL...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -191,11 +199,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Green Wave Rider Engine] Connecting...");
+  console.log("🌊 [Smart Filter Wave Rider Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for high-potential wave runners...");
+    console.log("🟢 [Connected] Scanning for accelerating volume launches...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
