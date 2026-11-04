@@ -17,7 +17,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Active Elite Sniper: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Momentum Wave Rider Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -53,13 +53,13 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Position Manager with 8% trailing profit lock
+// Position Manager: Tracks green waves and secures profits on an 8% pullback
 async function monitorAndExit(tokenMint, buyAmountUnits) {
-  console.log(`👀 [Position Manager] Tracking price action for ${tokenMint.slice(0, 8)}...`);
+  console.log(`👀 [Wave Rider] Tracking price action for ${tokenMint.slice(0, 8)}...`);
   
   let peakValue = 0;
   const startTime = Date.now();
-  const maxHoldTimeMs = 3 * 60 * 1000; // 3-minute max limit
+  const maxHoldTimeMs = 3 * 60 * 1000; // 3-minute momentum cap
 
   const checkInterval = setInterval(async () => {
     try {
@@ -72,17 +72,18 @@ async function monitorAndExit(tokenMint, buyAmountUnits) {
       const currentValueSol = parseInt(quote.outAmount) / 1e9;
       if (currentValueSol > peakValue) peakValue = currentValueSol;
 
-      console.log(`📈 [Price Check] Current Value: ${currentValueSol.toFixed(4)} SOL (Peak: ${peakValue.toFixed(4)} SOL)`);
+      console.log(`📈 [Green Wave Check] Current: ${currentValueSol.toFixed(4)} SOL (Peak: ${peakValue.toFixed(4)} SOL)`);
 
+      // Exit Condition: Secure profits if price pulls back 8% from its green peak, or hits timeout
       const pulledBackFromPeak = peakValue > 0.005 && currentValueSol < peakValue * 0.92;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pulledBackFromPeak || timedOut) {
         clearInterval(checkInterval);
-        console.log(`🚨 [Exit Triggered] Selling token (8% pullback or timeout reached)...`);
+        console.log(`🚨 [Profit Lock] Selling token to secure gains...`);
         
         const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
-        console.log(`✅ [SOLD!] Solscan: https://solscan.io/tx/${sellTxid}`);
+        console.log(`✅ [PROFIT SECURED!] Solscan: https://solscan.io/tx/${sellTxid}`);
         isTrading = false;
       }
     } catch (e) {}
@@ -113,62 +114,59 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // --- STRICT SOCIAL & METADATA FILTER ---
+    // --- INITIAL METADATA & SOCIAL CHECK ---
     try {
       const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (coinRes.ok) {
         const coinData = await coinRes.json();
-        
-        // Check description length
-        if (!coinData.description || coinData.description.length < 5) {
-          console.log(`🚫 [Safety Filter] Skipped: Description too short or missing.`);
-          isTrading = false;
-          return;
-        }
-
-        // Require at least Twitter (X) or Telegram link to avoid blank low-effort spam rugs
         const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
         const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
 
-        if (!hasTwitter && !hasTelegram) {
-          console.log(`🚫 [Social Filter] Skipped: Token lacks both Twitter and Telegram links.`);
-          isTrading = false;
-          return;
-        }
-
-        console.log(`✅ [Social Filter Passed] Found Socials -> Twitter: ${hasTwitter ? 'Yes' : 'No'}, Telegram: ${hasTelegram ? 'Yes' : 'No'}`);
-      }
-    } catch (e) {
-      console.log(`⚠️ Metadata verification warning, continuing with caution...`);
-    }
-
-    // --- 15-SECOND LAUNCH DELAY ---
-    console.log(`⏳ [Launch Delay] Waiting 15s for ${newMint.slice(0, 8)} to survive initial dump...`);
-    await new Promise(resolve => setTimeout(resolve, 15000));
-
-    // Re-verify bonding curve hasn't completed or crashed after the delay
-    try {
-      const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (checkRes.ok) {
-        const checkData = await checkRes.json();
-        if (checkData.complete) {
-          console.log(`🚫 [Delay Filter] Token already completed bonding curve. Skipping.`);
+        if (!coinData.description || coinData.description.length < 5 || (!hasTwitter && !hasTelegram)) {
+          console.log(`🚫 [Filter] Skipped: Lacks proper description or social links.`);
           isTrading = false;
           return;
         }
       }
     } catch (e) {}
 
-    // 20% Position Sizing
+    // --- 15-SECOND MOMENTUM DELAY ---
+    console.log(`⏳ [Delay Window] Waiting 15s to check volume formation for ${newMint.slice(0, 8)}...`);
+    await new Promise(resolve => setTimeout(resolve, 15000));
+
+    // --- VOLUME & SURVIVAL VALIDATION ---
+    try {
+      const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (checkRes.ok) {
+        const checkData = await checkRes.json();
+        
+        // Skip if bonding curve already completed or virtual reserves indicate a dead launch
+        if (checkData.complete) {
+          console.log(`🚫 [Volume Filter] Token already graduated/completed. Skipping.`);
+          isTrading = false;
+          return;
+        }
+
+        // Ensure there is active volume growth (virtual sol reserves must increase past initial baseline)
+        const currentSolReserves = checkData.virtual_sol_reserves || 0;
+        if (currentSolReserves < 3200000000) { // below threshold means no green wave formed
+          console.log(`🚫 [Volume Filter] Token failed to attract green volume during delay. Skipping.`);
+          isTrading = false;
+          return;
+        }
+      }
+    } catch (e) {}
+
+    // Conservative 20% Position Sizing with gas protection
     const ALLOCATION_PERCENTAGE = 0.20; 
     const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Target Passed All Elite Filters] Token Mint: ${newMint}`);
-    console.log(`🚀 [Snipe Buying] Spending 20% (${solToAllocate.toFixed(4)} SOL)...`);
+    console.log(`🎯 [Green Wave Confirmed] Token Mint: ${newMint}`);
+    console.log(`🚀 [Riding Wave] Buying with ${solToAllocate.toFixed(4)} SOL...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
-    console.log(`✅ [SNIPE EXECUTED!] Solscan: https://solscan.io/tx/${txid}`);
+    console.log(`✅ [ENTRY SUCCESSFUL] Solscan: https://solscan.io/tx/${txid}`);
 
     setTimeout(async () => {
       try {
@@ -177,7 +175,7 @@ async function handleSnipe(signature) {
         if (tokenUnits) {
           monitorAndExit(newMint, tokenUnits);
         } else {
-          console.log(`⚠️ Could not verify token units. Resetting trading lock.`);
+          console.log(`⚠️ Balance units unverified. Resetting lock.`);
           isTrading = false;
         }
       } catch (err) {
@@ -186,17 +184,17 @@ async function handleSnipe(signature) {
     }, 5000);
 
   } catch (err) {
-    console.error(`❌ Snipe Execution Error: ${err.message}`);
+    console.error(`❌ Execution Error: ${err.message}`);
     isTrading = false;
   }
 }
 
 function startListener() {
-  console.log("⚡ [Elite Sniper Engine] Connecting...");
+  console.log("🌊 [Momentum Wave Sniper Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning with Social Checks, 15s Delay, and 8% Trailing Exits...");
+    console.log("🟢 [Connected] Scanning for organic green waves...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
