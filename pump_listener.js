@@ -1,245 +1,63 @@
-import WebSocket from 'ws';
-import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
-import bs58 from 'bs58';
-import fetch from 'cross-fetch';
+    // --- STEP 2: EXPONENTIAL VOLUME VELOCITY CHECK ---
+    console.log(`⏳ [Volume Engine] Sampling baseline metrics for ${newMint.slice(0, 8)}...`);
 
-const WS_URL = process.env.WS_URL;
-const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
-const PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
-const SOL_MINT = 'So11111111111111111111111111111111111111112';
+    let solAtT0 = 0;
+    let solAtT5 = 0;
+    let solAtT15 = 0;
 
-const connection = new Connection(RPC_URL, 'confirmed');
-
-let wallet;
-try {
-  let raw = process.env.BOT_PRIVATE_KEY ? process.env.BOT_PRIVATE_KEY.trim() : "";
-  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
-    raw = raw.slice(1, -1).trim();
-  }
-  wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Single-Shot Wave Rider Active: ${wallet.publicKey.toString()}`);
-} catch (err) {
-  console.error("❌ Private Key Error:", err.message);
-  process.exit(1);
-}
-
-// Global lock: When true, bot ignores all other launches until current trade closes
-let isTrading = false;
-
-async function executeSwap(inputMint, outputMint, amountUnits) {
-  const quoteRes = await fetch(
-    `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountUnits}&slippageBps=500`
-  );
-  const quote = await quoteRes.json();
-  if (quote.error) throw new Error(`Quote Error: ${quote.error}`);
-
-  const swapRes = await fetch('https://api.jup.ag/swap/v1/swap', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toString(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: 'auto'
-    })
-  });
-  
-  const swapData = await swapRes.json();
-  if (!swapData.swapTransaction) throw new Error("Failed to generate swap transaction.");
-
-  const transaction = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
-  transaction.sign([wallet]);
-
-  return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
-}
-
-// Position Manager: Rides the green wave with trailing profit lock and stop-loss
-async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
-  console.log(`👀 [Single-Position Manager] Riding green wave for ${tokenMint.slice(0, 8)}...`);
-  
-  let peakValue = initialSolSpent;
-  const startTime = Date.now();
-  const maxHoldTimeMs = 4 * 60 * 1000; // 4-minute limit
-
-  const checkInterval = setInterval(async () => {
+    // Sample T0 (Initial launch state)
     try {
-      const quoteRes = await fetch(
-        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${buyAmountUnits}&slippageBps=500`
-      );
-      const quote = await quoteRes.json();
-      if (!quote || quote.error) return;
+      const res0 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (res0.ok) solAtT0 = (await res0.json()).virtual_sol_reserves || 0;
+    } catch (e) {}
 
-      const currentValueSol = parseInt(quote.outAmount) / 1e9;
-      
-      if (currentValueSol > peakValue) {
-        peakValue = currentValueSol;
-      }
+    // Wait 5 seconds and sample T5
+    await new Promise(resolve => setTimeout(resolve, 5000));
+    try {
+      const res5 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (res5.ok) solAtT5 = (await res5.json()).virtual_sol_reserves || 0;
+    } catch (e) {}
 
-      console.log(`📈 [Wave Check] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
-
-      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.02) && currentValueSol < peakValue * 0.90;
-      const hitStopLoss = currentValueSol <= initialSolSpent * 0.92;
-      const timedOut = Date.now() - startTime > maxHoldTimeMs;
-
-      if (pulledBackFromPeak || hitStopLoss || timedOut) {
-        clearInterval(checkInterval);
-        console.log(pulledBackFromPeak ? `🟢 [Peak Secured] Selling for profit...` : `🚨 [Stop-Loss/Timeout] Closing position...`);
+    // Wait remaining 10 seconds and sample T15
+    await new Promise(resolve => setTimeout(resolve, 10000));
+    try {
+      const res15 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (res15.ok) {
+        const data15 = await res15.json();
+        solAtT15 = data15.virtual_sol_reserves || 0;
         
-        const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
-        console.log(`✅ [POSITION CLOSED] Solscan: https://solscan.io/tx/${sellTxid}`);
-        
-        isTrading = false;
-        console.log(`🔄 [Status] Bot unlocked and ready for the next clean coin.`);
+        if (data15.complete) {
+          console.log(`🚫 [Volume Filter] Curve completed during check. Skipping.`);
+          isTrading = false;
+          return;
+        }
       }
     } catch (e) {}
-  }, 4000);
-}
 
-async function handleSnipe(signature) {
-  try {
-    const balanceLamports = await connection.getBalance(wallet.publicKey);
-    const balanceSol = balanceLamports / 1e9;
+    // Calculate volume velocity deltas (in SOL units)
+    const initialGrowthSol = (solAtT5 - solAtT0) / 1e9;
+    const secondaryGrowthSol = (solAtT15 - solAtT5) / 1e9;
+    const totalGrowthSol = (solAtT15 - solAtT0) / 1e9;
+
+    console.log(`📊 [Volume Stats] T0->T5: +${initialGrowthSol.toFixed(2)} SOL | T5->T15: +${secondaryGrowthSol.toFixed(2)} SOL | Total: +${totalGrowthSol.toFixed(2)} SOL`);
+
+    // --- FILTER RULES ---
+    // Rule A: Total SOL added must exceed at least 3 SOL (filters tiny micro-bot manipulation)
+    const MIN_REQUIRED_GROWTH = 3.0; 
     
-    if (balanceSol < 0.015) {
+    // Rule B: Acceleration must be positive (volume in the last 10s must be faster than the first 5s)
+    const isAccelerating = secondaryGrowthSol > (initialGrowthSol * 1.2);
+
+    if (totalGrowthSol < MIN_REQUIRED_GROWTH) {
+      console.log(`🚫 [Filter Skipped] Low volume growth (+${totalGrowthSol.toFixed(2)} SOL < ${MIN_REQUIRED_GROWTH} SOL target).`);
       isTrading = false;
       return;
     }
 
-    const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 1 });
-    if (!tx || !tx.meta) {
+    if (!isAccelerating) {
+      console.log(`🚫 [Filter Skipped] Volume is slowing down, not accelerating. Wave is dying.`);
       isTrading = false;
       return;
     }
 
-    const postTokenBalances = tx.meta.postTokenBalances || [];
-    const newMint = postTokenBalances.find(b => b.mint !== SOL_MINT)?.mint;
-    if (!newMint) {
-      isTrading = false;
-      return;
-    }
-
-    // --- METADATA & SOCIAL CHECK ---
-    try {
-      const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (coinRes.ok) {
-        const coinData = await coinRes.json();
-        const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
-        const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
-
-        if (!coinData.description || coinData.description.length < 5 || (!hasTwitter && !hasTelegram)) {
-          console.log(`🚫 [Filter] Skipped spam token.`);
-          isTrading = false;
-          return;
-        }
-      }
-    } catch (e) {
-      isTrading = false;
-      return;
-    }
-
-    let initialReserves = 0;
-    try {
-      const initRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (initRes.ok) {
-        const initData = await initRes.json();
-        initialReserves = initData.virtual_sol_reserves || 0;
-      }
-    } catch (e) {}
-
-    // --- 15-SECOND VOLUME ACCELERATION CHECK ---
-    console.log(`⏳ [Deep Verification] Waiting 15s to validate volume growth for ${newMint.slice(0, 8)}...`);
-    await new Promise(resolve => setTimeout(resolve, 15000));
-
-    try {
-      const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (checkRes.ok) {
-        const checkData = await checkRes.json();
-        if (checkData.complete) {
-          console.log(`🚫 [Filter] Token completed bonding curve. Skipping.`);
-          isTrading = false;
-          return;
-        }
-
-        const currentReserves = checkData.virtual_sol_reserves || 0;
-        if (currentReserves <= initialReserves) {
-          console.log(`🚫 [Volume Failed] Reserves did not grow during delay. Skipping.`);
-          isTrading = false;
-          return;
-        }
-      }
-    } catch (e) {
-      isTrading = false;
-      return;
-    }
-
-    // Allocate full wallet amount minus gas buffer
-    const solToAllocate = Math.max(0.005, balanceSol - 0.005);
-    const amountLamports = Math.floor(solToAllocate * 1e9);
-
-    console.log(`🎯 [Verified Entry] Deploying full wallet (${solToAllocate.toFixed(4)} SOL) into ${newMint.slice(0, 8)}...`);
-
-    const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
-    console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
-
-    setTimeout(async () => {
-      try {
-        const tokenAccountsRes = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, { mint: newMint });
-        const tokenUnits = tokenAccountsRes.value[0]?.account?.data?.parsed?.info?.tokenAmount?.amount;
-        if (tokenUnits) {
-          monitorAndRideSinglePosition(newMint, tokenUnits, solToAllocate);
-        } else {
-          isTrading = false;
-        }
-      } catch (err) {
-        isTrading = false;
-      }
-    }, 4000);
-
-  } catch (err) {
-    isTrading = false;
-  }
-}
-
-function startListener() {
-  console.log("🌊 [Single-Shot Wave Rider Engine] Connecting...");
-  const ws = new WebSocket(WS_URL);
-
-  ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for high-conviction single trades...");
-    ws.send(JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "logsSubscribe",
-      params: [
-        { mentions: [PUMP_FUN_PROGRAM_ID] },
-        { commitment: "processed" }
-      ]
-    }));
-  });
-
-  ws.on('message', async (data) => {
-    try {
-      if (isTrading) return; // Ignore everything else while in a trade
-
-      const payload = JSON.parse(data.toString());
-      if (!payload.params || !payload.params.result) return;
-
-      const logs = payload.params.result.value.logs || [];
-      const signature = payload.params.result.value.signature;
-
-      if (logs.some(log => log.includes("Instruction: Create"))) {
-        isTrading = true;
-        await handleSnipe(signature);
-      }
-    } catch (e) {}
-  });
-
-  ws.on('close', () => {
-    setTimeout(startListener, 3000);
-  });
-
-  ws.on('error', (err) => {});
-}
-
-startListener();
+    console.log(`🚀 [GREEN WAVE CONFIRMED] Accelerating volume detected! Deploying trade...`);
