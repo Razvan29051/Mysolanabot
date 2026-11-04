@@ -4,33 +4,44 @@ import fetch from 'cross-fetch';
 
 const connection = new Connection(process.env.RPC_URL, 'confirmed');
 
-// Load private key safely handling arrays or strings
 let wallet;
 try {
-  const rawSecret = process.env.BOT_PRIVATE_KEY.trim();
-  let secretBytes;
+  let raw = process.env.BOT_PRIVATE_KEY ? process.env.BOT_PRIVATE_KEY.trim() : "";
   
-  if (rawSecret.startsWith('[')) {
-    secretBytes = Uint8Array.from(JSON.parse(rawSecret));
-  } else {
-    secretBytes = bs58.decode(rawSecret);
+  // Remove wrapping quotes if any
+  if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+    raw = raw.slice(1, -1).trim();
   }
-  
-  wallet = Keypair.fromSecretKey(secretBytes);
-} catch (e) {
-  // Fallback: direct base58 decode attempt
-  wallet = Keypair.fromSecretKey(bs58.decode(process.env.BOT_PRIVATE_KEY.trim()));
+
+  let secretBytes;
+  if (raw.startsWith('[')) {
+    secretBytes = Uint8Array.from(JSON.parse(raw));
+  } else {
+    secretBytes = bs58.decode(raw);
+  }
+
+  // Handle both 32-byte seeds and 64-byte full secret keys automatically
+  if (secretBytes.length === 64) {
+    wallet = Keypair.fromSecretKey(secretBytes);
+  } else if (secretBytes.length === 32) {
+    wallet = Keypair.fromSeed(secretBytes);
+  } else {
+    throw new Error(`Unexpected secret key length: ${secretBytes.length} bytes. Expected 32 or 64.`);
+  }
+
+  console.log(`🔑 Wallet successfully loaded: ${wallet.publicKey.toString()}`);
+} catch (err) {
+  console.error("❌ CRITICAL WALLET ERROR:", err.message);
+  throw err;
 }
 
 async function runAutoTrade() {
-  console.log(`🤖 Bot Active | Executing for Wallet: ${wallet.publicKey.toString()}`);
-
   const SOL_MINT = 'So11111111111111111111111111111111111111112';
   const WIF_MINT = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm';
   const tradeAmountLamports = 0.02 * 1e9; // 0.02 SOL
 
   try {
-    console.log("Fetching live DEX quote...");
+    console.log("Fetching live DEX quote from Jupiter...");
     const quoteRes = await fetch(
       `https://quote-api.jup.ag/v6/quote?inputMint=${SOL_MINT}&outputMint=${WIF_MINT}&amount=${tradeAmountLamports}&slippageBps=100`
     );
