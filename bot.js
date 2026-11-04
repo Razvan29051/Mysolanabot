@@ -18,23 +18,21 @@ try {
   throw err;
 }
 
-// Risk and Scalping Parameters (Matching your UI desk logic)
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const DEFAULT_TARGET_MINT = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm'; // Default target token (e.g., WIF)
+const DEFAULT_TARGET_MINT = 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm'; // WIF
 const TRADE_ALLOC_SOL = 0.02; // Amount of SOL to allocate per trade
-const STOP_LOSS_PCT = -7.0;       // Hard stop loss cut
-const TRAIL_ACTIVATION_PCT = 20.0; // Profit threshold to arm trailing mode
-const TRAIL_DRAWDOWN_PCT = 6.0;   // Drop from peak to trigger trailing exit
 
 async function executeSwap(inputMint, outputMint, amountLamports) {
-  console.log(`🔄 [Executor] Requesting Jupiter quote for swap...`);
+  console.log(`🔄 [Executor] Requesting new Jupiter V1 quote endpoint...`);
+  
+  // Updated to the current active Jupiter V1 API endpoint
   const quoteRes = await fetch(
-    `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=150`
+    `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=150`
   );
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Jupiter Quote Error: ${quote.error}`);
 
-  const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+  const swapRes = await fetch('https://api.jup.ag/swap/v1/swap', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -60,12 +58,10 @@ async function runScalperCycle() {
   console.log(`⚡ [System] Starting Multi-X Scalper Cycle...`);
 
   try {
-    // 1. Fetch live balance
     const balanceLamports = await connection.getBalance(wallet.publicKey);
     const balanceSol = balanceLamports / 1e9;
     console.log(`💰 [Wallet] Live Balance: ${balanceSol.toFixed(4)} SOL`);
 
-    // 2. Check token holdings in wallet
     const tokenAccounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
       programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
     });
@@ -90,31 +86,24 @@ async function runScalperCycle() {
     if (activeTokenAccount) {
       console.log(`📊 [Position Active] Found holding for token: ${tokenMint} (Balance: ${tokenBalance})`);
 
-      // Calculate current value in SOL via Jupiter Quote
       const quoteRes = await fetch(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${tokenAmountRaw}&slippageBps=150`
+        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${tokenAmountRaw}&slippageBps=150`
       );
       const quote = await quoteRes.json();
       
       if (quote.outAmount) {
         const currentSolVal = quote.outAmount / 1e9;
         console.log(`💡 [Analyst] Estimated liquidation value: ${currentSolVal.toFixed(4)} SOL`);
-        
-        // Note: In GitHub Actions stateless runs, we evaluate safety bounds or let the trade ride 
-        // until a hard stop/take profit condition triggers via live DEX pricing.
-        // If you wish to dump back to SOL immediately on command or specific triggers, it executes here.
       }
-
       console.log(`🛡️ [Risk Engine] Position active. Monitoring trailing targets...`);
 
     } else {
-      // No active positions, scout and buy if budget allows
       if (balanceSol < TRADE_ALLOC_SOL + 0.005) {
-        console.log(`⚠️ [Scout] Balance too low to open a new position safely (needs min gas + allocation).`);
+        console.log(`⚠️ [Scout] Balance too low to open a new position safely.`);
         return;
       }
 
-      console.log(`🎯 [Scout] High-momentum token scanned. Executing buy order for ${DEFAULT_TARGET_MINT}...`);
+      console.log(`🎯 [Scout] High-momentum token scanned. Executing buy order...`);
       const buyAmountLamports = Math.floor(TRADE_ALLOC_SOL * 1e9);
       const txid = await executeSwap(SOL_MINT, DEFAULT_TARGET_MINT, buyAmountLamports);
       
