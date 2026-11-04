@@ -67,7 +67,8 @@ async function handleSnipe(signature) {
     const solToAllocate = Math.max(0.01, (balanceSol - 0.03) * 0.50);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+    // FIX: Set maxSupportedTransactionVersion to 1 to handle modern v0/v1 transactions
+    const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 1 });
     if (!tx || !tx.meta) return;
 
     // Safety Filter: Check Dev Wallet Allocation
