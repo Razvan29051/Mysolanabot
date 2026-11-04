@@ -16,7 +16,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Graduation Rider Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Clean Graduation Rider Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -24,20 +24,14 @@ try {
 
 let isTrading = false;
 const processedTokens = new Set();
-let lastRequestTime = 0;
+let lastCheckTimestamp = 0;
 
 async function safeFetch(url, options = {}) {
-  const now = Date.now();
-  if (now - lastRequestTime < 300) {
-    await new Promise(resolve => setTimeout(resolve, 300 - (now - lastRequestTime)));
-  }
-  lastRequestTime = Date.now();
-
   for (let i = 0; i < 3; i++) {
     try {
       const res = await fetch(url, options);
       if (res.status === 429) {
-        await new Promise(resolve => setTimeout(resolve, 2000 * (i + 1)));
+        await new Promise(resolve => setTimeout(resolve, 3000 * (i + 1)));
         continue;
       }
       return res;
@@ -81,7 +75,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
   
   let peakValue = initialSolSpent;
   const startTime = Date.now();
-  const maxHoldTimeMs = 6 * 60 * 1000; // Longer hold for migrated tokens
+  const maxHoldTimeMs = 6 * 60 * 1000;
 
   const checkInterval = setInterval(async () => {
     try {
@@ -139,7 +133,6 @@ async function handleGraduationCandidate(signature) {
 
     processedTokens.add(newMint);
 
-    // Check bonding curve state to see how close it is to graduation
     const coinRes = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
     if (!coinRes.ok) {
       isTrading = false;
@@ -153,18 +146,16 @@ async function handleGraduationCandidate(signature) {
     }
 
     const virtualSol = coinData.virtual_sol_reserves || 0;
-    // Pump.fun curves graduate around 85+ SOL reserves roughly
     const graduationProgress = (virtualSol / 85000000000) * 100;
 
-    console.log(`🔍 [Curve Check] Token ${newMint.slice(0, 8)} Progress: ${graduationProgress.toFixed(1)}%`);
+    console.log(`🔍 [Curve Check] Progress: ${graduationProgress.toFixed(1)}%`);
 
-    // Only target tokens that are past 75% graduation progress
     if (graduationProgress < 75) {
       isTrading = false;
       return;
     }
 
-    console.log(`🎯 [Graduation Target Found!] Entering near completion phase...`);
+    console.log(`🎯 [Graduation Target Found!] Entering near completion...`);
 
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
@@ -192,11 +183,11 @@ async function handleGraduationCandidate(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Graduation Stream Engine] Connecting...");
+  console.log("🌊 [Throttled Graduation Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for high-progress bonding curves...");
+    console.log("🟢 [Connected] Scanning cleanly without rate spikes...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -212,13 +203,17 @@ function startListener() {
     try {
       if (isTrading) return;
 
+      // Throttle incoming messages: only process one event every 3 seconds max
+      const now = Date.now();
+      if (now - lastCheckTimestamp < 3000) return;
+      lastCheckTimestamp = now;
+
       const payload = JSON.parse(data.toString());
       if (!payload.params || !payload.params.result) return;
 
       const logs = payload.params.result.value.logs || [];
       const signature = payload.params.result.value.signature;
 
-      // Listen for buy/trade events or updates rather than just raw creates
       const isTradeEvent = logs.some(log => 
         log.toLowerCase().includes("instruction: buy") || 
         log.toLowerCase().includes("trade")
