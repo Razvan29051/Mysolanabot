@@ -16,7 +16,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Native Wave Rider Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Universal Listener Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -117,9 +117,9 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // --- QUICK 10-SECOND SUSTAINED GROWTH CHECK ---
-    console.log(`⏳ [Volume Engine] Sampling baseline for ${newMint.slice(0, 8)}...`);
+    console.log(`🔍 [Detected Launch] Mint found: ${newMint}. Starting observation window...`);
 
+    // --- 10-SECOND SUSTAINED GROWTH CHECK ---
     let solAtT0 = 0;
     try {
       const res0 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
@@ -144,9 +144,9 @@ async function handleSnipe(signature) {
     const growthSol = (solAtT10 - solAtT0) / 1e9;
     console.log(`📊 [10s Growth Check] Net Growth: +${growthSol.toFixed(2)} SOL`);
 
-    // Flexible threshold: ensure it gained at least 0.4 SOL and didn't dump
-    if (growthSol < 0.4) {
-      console.log(`🚫 [Skipped] Insufficient volume growth (+${growthSol.toFixed(2)} SOL). Searching next...`);
+    // Gentle threshold to ensure we actually catch live tokens moving forward
+    if (growthSol < 0.2) {
+      console.log(`🚫 [Skipped] Flat volume (+${growthSol.toFixed(2)} SOL). Searching next...`);
       isTrading = false;
       return;
     }
@@ -180,18 +180,18 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Native Wave Rider Engine] Connecting...");
+  console.log("🌊 [Universal Wave Rider Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning for organic green waves...");
+    console.log("🟢 [Connected] Listening for live Pump.fun creation logs...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
       method: "logsSubscribe",
       params: [
         { mentions: [PUMP_FUN_PROGRAM_ID] },
-        { commitment: "processed" }
+        { commitment: "confirmed" }
       ]
     }));
   });
@@ -206,7 +206,14 @@ function startListener() {
       const logs = payload.params.result.value.logs || [];
       const signature = payload.params.result.value.signature;
 
-      if (logs.some(log => log.includes("Instruction: Create"))) {
+      // Universal check: catches any variation of create/initialize instructions
+      const isCreateEvent = logs.some(log => 
+        log.toLowerCase().includes("instruction: create") || 
+        log.toLowerCase().includes("initialize") ||
+        log.toLowerCase().includes("create")
+      );
+
+      if (isCreateEvent) {
         isTrading = true;
         await handleSnipe(signature);
       }
