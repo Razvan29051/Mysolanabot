@@ -16,23 +16,43 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Multi-Agent Wave Sniper Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Rate-Safe Wave Sniper Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
 }
 
-// Single-position lock flag
 let isTrading = false;
+const processedTokens = new Set(); // Prevents duplicate triggers for the same token
+
+// Safe fetch wrapper with built-in 429 rate limit backoff
+async function safeFetch(url, options = {}, retries = 3, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, options);
+      if (res.status === 429) {
+        console.log(`⚠️ Rate limited (429). Backing off for ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2; // Exponential backoff
+        continue;
+      }
+      return res;
+    } catch (err) {
+      if (i === retries - 1) throw err;
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+  throw new Error("Max retries reached due to rate limiting.");
+}
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
-  const quoteRes = await fetch(
+  const quoteRes = await safeFetch(
     `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountUnits}&slippageBps=500`
   );
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Quote Error: ${quote.error}`);
 
-  const swapRes = await fetch('https://api.jup.ag/swap/v1/swap', {
+  const swapRes = await safeFetch('https://api.jup.ag/swap/v1/swap', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -53,66 +73,27 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// AGENT 1: Holder Supply Concentration Filter (On-Chain RPC)
-async function checkHolderDistribution(tokenMint) {
-  try {
-    const mintPublicKey = new PublicKey(tokenMint);
-    const largestAccounts = await connection.getTokenLargestAccounts(mintPublicKey);
-    
-    if (!largestAccounts || !largestAccounts.value || largestAccounts.value.length === 0) {
-      return false;
-    }
-
-    const totalSupply = 1_000_000_000 * 1e6; // Standard Pump.fun supply (1 Billion tokens)
-    const accounts = largestAccounts.value;
-
-    // Skip index 0 as it usually represents the Pump.fun bonding curve vault
-    let insiderTokensHeld = 0;
-    for (let i = 1; i < Math.min(accounts.length, 6); i++) {
-      insiderTokensHeld += parseInt(accounts[i].amount || 0);
-    }
-
-    const insiderSharePercent = (insiderTokensHeld / totalSupply) * 100;
-    console.log(`🔍 [Agent 1: Distribution] Top 5 Holders Own: ${insiderSharePercent.toFixed(2)}% of supply`);
-
-    // Reject if top 5 non-bonding-curve wallets hold more than 25% of total supply
-    if (insiderSharePercent > 25) {
-      console.log(`🚫 [Agent 1 Skipped] Supply concentrated in too few wallets (${insiderSharePercent.toFixed(1)}%).`);
-      return false;
-    }
-
-    return true;
-  } catch (err) {
-    // If holder RPC call fails, continue safely
-    return true;
-  }
-}
-
-// AGENT 2: Metadata & Community Sentiment Check
+// Lightweight Metadata & Social Check
 async function checkTokenMetadata(tokenMint) {
   try {
-    const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${tokenMint}`);
+    const coinRes = await safeFetch(`https://frontend-api.pump.fun/coins/${tokenMint}`);
     if (!coinRes.ok) return false;
 
     const coinData = await coinRes.json();
     const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
     const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
-    const hasDescription = coinData.description && coinData.description.length > 5;
-
-    console.log(`🎨 [Agent 2: Metadata] Has Socials: ${hasTwitter || hasTelegram} | Description: ${hasDescription}`);
+    const hasDescription = coinData.description && coinData.description.length > 3;
 
     if (!hasDescription || (!hasTwitter && !hasTelegram)) {
-      console.log(`🚫 [Agent 2 Skipped] Missing basic social links or narrative metadata.`);
       return false;
     }
-
     return true;
   } catch (err) {
     return false;
   }
 }
 
-// Single Position Manager: Rides green wave with trailing exit lock
+// Position Manager: Rides green wave with trailing profit lock and stop-loss
 async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
   console.log(`👀 [Position Manager] Tracking wave for ${tokenMint.slice(0, 8)}...`);
   
@@ -122,7 +103,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
 
   const checkInterval = setInterval(async () => {
     try {
-      const quoteRes = await fetch(
+      const quoteRes = await safeFetch(
         `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${buyAmountUnits}&slippageBps=500`
       );
       const quote = await quoteRes.json();
@@ -151,7 +132,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         console.log(`🔄 [Status] Wallet unlocked for next clean setup.`);
       }
     } catch (e) {}
-  }, 4000);
+  }, 5000);
 }
 
 async function handleSnipe(signature) {
@@ -172,64 +153,59 @@ async function handleSnipe(signature) {
 
     const postTokenBalances = tx.meta.postTokenBalances || [];
     const newMint = postTokenBalances.find(b => b.mint !== SOL_MINT)?.mint;
-    if (!newMint) {
+    if (!newMint || processedTokens.has(newMint)) {
       isTrading = false;
       return;
     }
 
-    console.log(`⚡ [New Token Detected] Address: ${newMint}`);
+    processedTokens.add(newMint);
+    console.log(`⚡ [Validated Target] Address: ${newMint}`);
 
-    // Run Agent 2 (Metadata & Sentiment)
+    // Quick metadata check
     const metadataOk = await checkTokenMetadata(newMint);
     if (!metadataOk) {
+      console.log(`🚫 [Skipped] Token lacks proper social/description metadata.`);
       isTrading = false;
       return;
     }
 
-    // Run Agent 1 (Supply Concentration Check)
-    const distributionOk = await checkHolderDistribution(newMint);
-    if (!distributionOk) {
-      isTrading = false;
-      return;
-    }
-
-    // Agent 3: 10-Second Volume Acceleration Check
-    console.log(`⏳ [Agent 3: Volume Engine] Sampling 10s velocity on ${newMint.slice(0, 8)}...`);
+    // 8-Second Volume Check with rate-limit protection
+    console.log(`⏳ [Volume Engine] Sampling reserves for ${newMint.slice(0, 8)}...`);
     let solAtT0 = 0;
     try {
-      const res0 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      const res0 = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (res0.ok) solAtT0 = (await res0.json()).virtual_sol_reserves || 0;
     } catch (e) {}
 
-    await new Promise(resolve => setTimeout(resolve, 10000));
+    await new Promise(resolve => setTimeout(resolve, 8000));
 
-    let solAtT10 = solAtT0;
+    let solAtT8 = solAtT0;
     try {
-      const res10 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
-      if (res10.ok) {
-        const data10 = await res10.json();
-        if (data10.complete) {
+      const res8 = await safeFetch(`https://frontend-api.pump.fun/coins/${newMint}`);
+      if (res8.ok) {
+        const data8 = await res8.json();
+        if (data8.complete) {
           isTrading = false;
           return;
         }
-        solAtT10 = data10.virtual_sol_reserves || 0;
+        solAtT8 = data8.virtual_sol_reserves || 0;
       }
     } catch (e) {}
 
-    const growthSol = (solAtT10 - solAtT0) / 1e9;
+    const growthSol = (solAtT8 - solAtT0) / 1e9;
     console.log(`📊 [Volume Stats] Net Growth: +${growthSol.toFixed(2)} SOL`);
 
-    if (growthSol < 0.3) {
-      console.log(`🚫 [Agent 3 Skipped] Low volume growth (+${growthSol.toFixed(2)} SOL).`);
+    if (growthSol < 0.2) {
+      console.log(`🚫 [Skipped] Insufficient volume growth (+${growthSol.toFixed(2)} SOL).`);
       isTrading = false;
       return;
     }
 
-    // Execution: Single-shot full wallet allocation
+    // Execution: Full wallet single allocation
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [ALL AGENT CHECKS PASSED] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
+    console.log(`🎯 [Execution] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -254,11 +230,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Multi-Agent Wave Engine] Connecting...");
+  console.log("🌊 [Rate-Safe Wave Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Listening for live creation events...");
+    console.log("🟢 [Connected] Listening cleanly without rate limits...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
