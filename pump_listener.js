@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 const WS_URL = process.env.WS_URL;
@@ -16,24 +16,23 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Rate-Safe Wave Sniper Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Production Sniper Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
 }
 
 let isTrading = false;
-const processedTokens = new Set(); // Prevents duplicate triggers for the same token
+const processedTokens = new Set();
 
-// Safe fetch wrapper with built-in 429 rate limit backoff
-async function safeFetch(url, options = {}, retries = 3, delay = 1000) {
+// Robust fetch with smooth rate-limit pacing
+async function safeFetch(url, options = {}, retries = 4, delay = 1500) {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, options);
       if (res.status === 429) {
-        console.log(`⚠️ Rate limited (429). Backing off for ${delay}ms...`);
         await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 2; // Exponential backoff
+        delay *= 1.5;
         continue;
       }
       return res;
@@ -42,7 +41,7 @@ async function safeFetch(url, options = {}, retries = 3, delay = 1000) {
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
-  throw new Error("Max retries reached due to rate limiting.");
+  throw new Error("Max retries reached.");
 }
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
@@ -73,7 +72,6 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Lightweight Metadata & Social Check
 async function checkTokenMetadata(tokenMint) {
   try {
     const coinRes = await safeFetch(`https://frontend-api.pump.fun/coins/${tokenMint}`);
@@ -84,18 +82,15 @@ async function checkTokenMetadata(tokenMint) {
     const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
     const hasDescription = coinData.description && coinData.description.length > 3;
 
-    if (!hasDescription || (!hasTwitter && !hasTelegram)) {
-      return false;
-    }
+    if (!hasDescription || (!hasTwitter && !hasTelegram)) return false;
     return true;
   } catch (err) {
     return false;
   }
 }
 
-// Position Manager: Rides green wave with trailing profit lock and stop-loss
 async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
-  console.log(`👀 [Position Manager] Tracking wave for ${tokenMint.slice(0, 8)}...`);
+  console.log(`👀 [Position Manager] Riding wave for ${tokenMint.slice(0, 8)}...`);
   
   let peakValue = initialSolSpent;
   const startTime = Date.now();
@@ -115,7 +110,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         peakValue = currentValueSol;
       }
 
-      console.log(`📈 [Position Track] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
+      console.log(`📈 [Wave Check] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
 
       const pulledBackFromPeak = peakValue > (initialSolSpent * 1.02) && currentValueSol < peakValue * 0.90;
       const hitStopLoss = currentValueSol <= initialSolSpent * 0.92;
@@ -161,15 +156,13 @@ async function handleSnipe(signature) {
     processedTokens.add(newMint);
     console.log(`⚡ [Validated Target] Address: ${newMint}`);
 
-    // Quick metadata check
     const metadataOk = await checkTokenMetadata(newMint);
     if (!metadataOk) {
-      console.log(`🚫 [Skipped] Token lacks proper social/description metadata.`);
+      console.log(`🚫 [Skipped] Token lacks proper social metadata.`);
       isTrading = false;
       return;
     }
 
-    // 8-Second Volume Check with rate-limit protection
     console.log(`⏳ [Volume Engine] Sampling reserves for ${newMint.slice(0, 8)}...`);
     let solAtT0 = 0;
     try {
@@ -201,7 +194,6 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // Execution: Full wallet single allocation
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
@@ -230,11 +222,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Rate-Safe Wave Engine] Connecting...");
+  console.log("🌊 [Production Wave Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Listening cleanly without rate limits...");
+    console.log("🟢 [Connected] Scanning for live green waves...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
