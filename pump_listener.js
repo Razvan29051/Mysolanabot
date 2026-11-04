@@ -1,5 +1,5 @@
 import WebSocket from 'ws';
-import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 const WS_URL = process.env.WS_URL;
@@ -16,12 +16,13 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Universal Listener Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Multi-Agent Wave Sniper Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
 }
 
+// Single-position lock flag
 let isTrading = false;
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
@@ -52,9 +53,68 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Position Manager: Rides the green wave with trailing profit lock and stop-loss
+// AGENT 1: Holder Supply Concentration Filter (On-Chain RPC)
+async function checkHolderDistribution(tokenMint) {
+  try {
+    const mintPublicKey = new PublicKey(tokenMint);
+    const largestAccounts = await connection.getTokenLargestAccounts(mintPublicKey);
+    
+    if (!largestAccounts || !largestAccounts.value || largestAccounts.value.length === 0) {
+      return false;
+    }
+
+    const totalSupply = 1_000_000_000 * 1e6; // Standard Pump.fun supply (1 Billion tokens)
+    const accounts = largestAccounts.value;
+
+    // Skip index 0 as it usually represents the Pump.fun bonding curve vault
+    let insiderTokensHeld = 0;
+    for (let i = 1; i < Math.min(accounts.length, 6); i++) {
+      insiderTokensHeld += parseInt(accounts[i].amount || 0);
+    }
+
+    const insiderSharePercent = (insiderTokensHeld / totalSupply) * 100;
+    console.log(`🔍 [Agent 1: Distribution] Top 5 Holders Own: ${insiderSharePercent.toFixed(2)}% of supply`);
+
+    // Reject if top 5 non-bonding-curve wallets hold more than 25% of total supply
+    if (insiderSharePercent > 25) {
+      console.log(`🚫 [Agent 1 Skipped] Supply concentrated in too few wallets (${insiderSharePercent.toFixed(1)}%).`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    // If holder RPC call fails, continue safely
+    return true;
+  }
+}
+
+// AGENT 2: Metadata & Community Sentiment Check
+async function checkTokenMetadata(tokenMint) {
+  try {
+    const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${tokenMint}`);
+    if (!coinRes.ok) return false;
+
+    const coinData = await coinRes.json();
+    const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
+    const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
+    const hasDescription = coinData.description && coinData.description.length > 5;
+
+    console.log(`🎨 [Agent 2: Metadata] Has Socials: ${hasTwitter || hasTelegram} | Description: ${hasDescription}`);
+
+    if (!hasDescription || (!hasTwitter && !hasTelegram)) {
+      console.log(`🚫 [Agent 2 Skipped] Missing basic social links or narrative metadata.`);
+      return false;
+    }
+
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Single Position Manager: Rides green wave with trailing exit lock
 async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
-  console.log(`👀 [Position Manager] Tracking green wave for ${tokenMint.slice(0, 8)}...`);
+  console.log(`👀 [Position Manager] Tracking wave for ${tokenMint.slice(0, 8)}...`);
   
   let peakValue = initialSolSpent;
   const startTime = Date.now();
@@ -74,21 +134,21 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         peakValue = currentValueSol;
       }
 
-      console.log(`📈 [Wave Check] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
+      console.log(`📈 [Position Track] Current: ${currentValueSol.toFixed(4)} SOL | Peak: ${peakValue.toFixed(4)} SOL`);
 
-      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.015) && currentValueSol < peakValue * 0.92;
-      const hitStopLoss = currentValueSol <= initialSolSpent * 0.93;
+      const pulledBackFromPeak = peakValue > (initialSolSpent * 1.02) && currentValueSol < peakValue * 0.90;
+      const hitStopLoss = currentValueSol <= initialSolSpent * 0.92;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pulledBackFromPeak || hitStopLoss || timedOut) {
         clearInterval(checkInterval);
-        console.log(pulledBackFromPeak ? `🟢 [Peak Secured] Selling for profit...` : `🚨 [Stop-Loss/Timeout] Closing position...`);
+        console.log(pulledBackFromPeak ? `🟢 [Profit Secured] Selling on peak pullback...` : `🚨 [Stop-Loss/Timeout] Closing position...`);
         
         const sellTxid = await executeSwap(tokenMint, SOL_MINT, buyAmountUnits);
         console.log(`✅ [POSITION CLOSED] Solscan: https://solscan.io/tx/${sellTxid}`);
         
         isTrading = false;
-        console.log(`🔄 [Status] Bot unlocked and ready for the next coin.`);
+        console.log(`🔄 [Status] Wallet unlocked for next clean setup.`);
       }
     } catch (e) {}
   }, 4000);
@@ -117,9 +177,24 @@ async function handleSnipe(signature) {
       return;
     }
 
-    console.log(`🔍 [Detected Launch] Mint found: ${newMint}. Starting observation window...`);
+    console.log(`⚡ [New Token Detected] Address: ${newMint}`);
 
-    // --- 10-SECOND SUSTAINED GROWTH CHECK ---
+    // Run Agent 2 (Metadata & Sentiment)
+    const metadataOk = await checkTokenMetadata(newMint);
+    if (!metadataOk) {
+      isTrading = false;
+      return;
+    }
+
+    // Run Agent 1 (Supply Concentration Check)
+    const distributionOk = await checkHolderDistribution(newMint);
+    if (!distributionOk) {
+      isTrading = false;
+      return;
+    }
+
+    // Agent 3: 10-Second Volume Acceleration Check
+    console.log(`⏳ [Agent 3: Volume Engine] Sampling 10s velocity on ${newMint.slice(0, 8)}...`);
     let solAtT0 = 0;
     try {
       const res0 = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
@@ -142,20 +217,19 @@ async function handleSnipe(signature) {
     } catch (e) {}
 
     const growthSol = (solAtT10 - solAtT0) / 1e9;
-    console.log(`📊 [10s Growth Check] Net Growth: +${growthSol.toFixed(2)} SOL`);
+    console.log(`📊 [Volume Stats] Net Growth: +${growthSol.toFixed(2)} SOL`);
 
-    // Gentle threshold to ensure we actually catch live tokens moving forward
-    if (growthSol < 0.2) {
-      console.log(`🚫 [Skipped] Flat volume (+${growthSol.toFixed(2)} SOL). Searching next...`);
+    if (growthSol < 0.3) {
+      console.log(`🚫 [Agent 3 Skipped] Low volume growth (+${growthSol.toFixed(2)} SOL).`);
       isTrading = false;
       return;
     }
 
-    // --- FULL WALLET ALLOCATION ---
+    // Execution: Single-shot full wallet allocation
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Green Wave Validated] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
+    console.log(`🎯 [ALL AGENT CHECKS PASSED] Deploying ${solToAllocate.toFixed(4)} SOL into ${newMint.slice(0, 8)}...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
@@ -180,11 +254,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Universal Wave Rider Engine] Connecting...");
+  console.log("🌊 [Multi-Agent Wave Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Listening for live Pump.fun creation logs...");
+    console.log("🟢 [Connected] Listening for live creation events...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -206,7 +280,6 @@ function startListener() {
       const logs = payload.params.result.value.logs || [];
       const signature = payload.params.result.value.signature;
 
-      // Universal check: catches any variation of create/initialize instructions
       const isCreateEvent = logs.some(log => 
         log.toLowerCase().includes("instruction: create") || 
         log.toLowerCase().includes("initialize") ||
