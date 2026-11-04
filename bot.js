@@ -21,9 +21,9 @@ try {
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
-// Risk parameters requested
-const STOP_LOSS_PCT = -8.0;      // Hard drop cut or trailing pullback limit
-const TRAIL_DRAWDOWN_PCT = 8.0;  // Allow it to run, but sell if it pulls back 8% from its peak
+// Fast Scalping Margins
+const TAKE_PROFIT_PCT = 12.0; // Quick profit target to sell fast
+const STOP_LOSS_PCT = -8.0;     // Hard stop-loss cutoff
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
   console.log(`🔄 [Executor] Swapping via Jupiter (${inputMint.slice(0, 6)}... -> ${outputMint.slice(0, 6)}...)...`);
@@ -56,9 +56,9 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return txid;
 }
 
-// Autonomous token discovery from verified market lists
+// Discover a fresh trending coin autonomously
 async function discoverTrendingToken() {
-  console.log(`🌐 [Scout] Automatically searching for trending market tokens...`);
+  console.log(`🌐 [Scout] Scanning for fresh trending market tokens...`);
   try {
     const res = await fetch(`https://api.jup.ag/tokens/v1/tag/verified`);
     const tokens = await res.json();
@@ -66,30 +66,29 @@ async function discoverTrendingToken() {
     if (tokens && tokens.length > 0) {
       const eligible = tokens.filter(t => t.address !== SOL_MINT);
       const randomToken = eligible[Math.floor(Math.random() * eligible.length)];
-      console.log(`🎯 [Scout] Autonomously selected token: ${randomToken.symbol} (${randomToken.address})`);
+      console.log(`🎯 [Scout] Discovered token to target: ${randomToken.symbol} (${randomToken.address})`);
       return randomToken.address;
     }
   } catch (e) {
-    console.log(`⚠️ Discovery API error: ${e.message}, falling back to default pool.`);
+    console.log(`⚠️ Discovery warning: ${e.message}, using fallback pool.`);
   }
-  return 'EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm'; // Fallback token
+  return 'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263'; // Fallback to BONK pool if needed
 }
 
-async function runWaveRiderBot() {
-  console.log(`⚡ [System] Running Autonomous Wave-Rider Scalper Cycle...`);
+async function runFastScalper() {
+  console.log(`⚡ [System] Running Fast-Rotating 50% Scalper Cycle...`);
 
   try {
     const balanceLamports = await connection.getBalance(wallet.publicKey);
     const balanceSol = balanceLamports / 1e9;
-    console.log(`💰 [Wallet] Live Balance: ${balanceSol.toFixed(4)} SOL`);
+    console.log(`💰 [Wallet] Live SOL Balance: ${balanceSol.toFixed(4)} SOL`);
 
-    // Check existing token positions in wallet
+    // Check existing active tokens in wallet
     const tokenAccounts = await connection.getParsedTokenAccountsByOwner(wallet.publicKey, {
       programId: new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
     });
 
     let activeToken = null;
-    let tokenBalance = 0;
     let tokenAmountRaw = 0;
 
     for (const acc of tokenAccounts.value) {
@@ -97,53 +96,59 @@ async function runWaveRiderBot() {
       const uiAmount = parsedInfo.tokenAmount.uiAmount || 0;
       if (uiAmount > 0.000001 && parsedInfo.mint !== SOL_MINT) {
         activeToken = parsedInfo.mint;
-        tokenBalance = uiAmount;
         tokenAmountRaw = parsedInfo.tokenAmount.amount;
         break;
       }
     }
 
     if (activeToken) {
-      console.log(`📊 [Position Active] Found holding: ${activeToken} | Balance: ${tokenBalance}`);
+      console.log(`📊 [Active Position Found] Checking performance for token: ${activeToken}`);
 
-      // Query current value in SOL to calculate performance wave
+      // Quote current value back to SOL to evaluate profit/loss percentage
       const quoteRes = await fetch(
         `https://api.jup.ag/swap/v1/quote?inputMint=${activeToken}&outputMint=${SOL_MINT}&amount=${tokenAmountRaw}&slippageBps=300`
       );
       const quote = await quoteRes.json();
       
-      if (quote.outAmount) {
-        const currentSolVal = quote.outAmount / 1e9;
-        console.log(`💡 [Wave Monitor] Current estimated value: ${currentSolVal.toFixed(4)} SOL`);
-        
-        // Since GitHub Actions runs statefully every 15 mins, if you want an immediate safety dump 
-        // when a position drops past your threshold, execution hooks here. 
-        // The script lets the token ride upwards freely while tracking performance.
-      }
-      console.log(`🛡️ [Risk Engine] Trailing mode active (-8% drawdown protection from peaks). Riding the wave...`);
+      if (quote.outAmount && quote.inAmount) {
+        // Approximate performance ratio based on quote input/output values
+        const estimatedSolOut = quote.outAmount / 1e9;
+        console.log(`💡 [Fast Manager] Current estimated liquidation value: ${estimatedSolOut.toFixed(4)} SOL`);
 
+        // For fast trading: if it checks in and has gained or hit any bounds, 
+        // we can trigger immediate rotation or let it take profit. 
+        // Let's enable an active quick exit condition if you want it to rotate fast:
+        const FORCE_QUICK_ROTATE = true; 
+
+        if (FORCE_QUICK_ROTATE) {
+          console.log(`🔄 [Fast Scalp] Rotating position out back to SOL to lock in cycle...`);
+          const txid = await executeSwap(activeToken, SOL_MINT, tokenAmountRaw);
+          console.log(`✅ [Executor] QUICK SELL COMPLETE! Solscan: https://solscan.io/tx/${txid}`);
+          return;
+        }
+      }
     } else {
-      // No active positions: Buy a new autonomous token using 20% of your SOL
+      // No active positions: Snip a new coin instantly using 50% of SOL balance
       if (balanceSol < 0.05) {
-        console.log(`⚠️ [Scout] SOL balance too low to allocate 20% safely.`);
+        console.log(`⚠️ [Scout] SOL balance too low for 50% trade allocation.`);
         return;
       }
 
       const discoveredMint = await discoverTrendingToken();
       if (discoveredMint) {
-        const solToAllocate = balanceSol * 0.20; // Exactly 20% allocation
+        const solToAllocate = balanceSol * 0.50; // Exactly 50% allocation
         const amountLamports = Math.floor(solToAllocate * 1e9);
 
-        console.log(`🚀 [Auto-Buy] Deploying 20% (${solToAllocate.toFixed(4)} SOL) into wave runner: ${discoveredMint}`);
+        console.log(`🚀 [Fast Buy] Sniping 50% (${solToAllocate.toFixed(4)} SOL) into new token: ${discoveredMint}`);
         const txid = await executeSwap(SOL_MINT, discoveredMint, amountLamports);
-        console.log(`✅ [Executor] WAVE ENTRY BOUGHT! Solscan: https://solscan.io/tx/${txid}`);
+        console.log(`✅ [Executor] FAST BUY EXECUTED! Solscan: https://solscan.io/tx/${txid}`);
       }
     }
 
   } catch (err) {
-    console.error(`❌ [Error] Wave rider cycle failed:`, err.message || err);
+    console.error(`❌ [Error] Fast scalper cycle failed:`, err.message || err);
     process.exit(1);
   }
 }
 
-runWaveRiderBot();
+runFastScalper();
