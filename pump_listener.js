@@ -17,7 +17,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Active Real-Time Sniper: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Active Elite Sniper: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -53,13 +53,13 @@ async function executeSwap(inputMint, outputMint, amountUnits) {
   return await connection.sendRawTransaction(transaction.serialize(), { skipPreflight: true });
 }
 
-// Position Manager with 8% trailing exit
+// Position Manager with 8% trailing profit lock
 async function monitorAndExit(tokenMint, buyAmountUnits) {
   console.log(`👀 [Position Manager] Tracking price action for ${tokenMint.slice(0, 8)}...`);
   
   let peakValue = 0;
   const startTime = Date.now();
-  const maxHoldTimeMs = 3 * 60 * 1000;
+  const maxHoldTimeMs = 3 * 60 * 1000; // 3-minute max limit
 
   const checkInterval = setInterval(async () => {
     try {
@@ -113,31 +113,46 @@ async function handleSnipe(signature) {
       return;
     }
 
-    // Metadata Filter Check
+    // --- STRICT SOCIAL & METADATA FILTER ---
     try {
       const coinRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (coinRes.ok) {
         const coinData = await coinRes.json();
+        
+        // Check description length
         if (!coinData.description || coinData.description.length < 5) {
-          console.log(`🚫 [Safety Filter] Skipped spam token.`);
+          console.log(`🚫 [Safety Filter] Skipped: Description too short or missing.`);
           isTrading = false;
           return;
         }
-      }
-    } catch (e) {}
 
-    // --- LAUNCH DELAY FILTER ---
-    console.log(`⏳ [Launch Delay] Waiting 15 seconds to let initial sniper dump clear for ${newMint.slice(0, 8)}...`);
+        // Require at least Twitter (X) or Telegram link to avoid blank low-effort spam rugs
+        const hasTwitter = coinData.twitter && coinData.twitter.trim().length > 0;
+        const hasTelegram = coinData.telegram && coinData.telegram.trim().length > 0;
+
+        if (!hasTwitter && !hasTelegram) {
+          console.log(`🚫 [Social Filter] Skipped: Token lacks both Twitter and Telegram links.`);
+          isTrading = false;
+          return;
+        }
+
+        console.log(`✅ [Social Filter Passed] Found Socials -> Twitter: ${hasTwitter ? 'Yes' : 'No'}, Telegram: ${hasTelegram ? 'Yes' : 'No'}`);
+      }
+    } catch (e) {
+      console.log(`⚠️ Metadata verification warning, continuing with caution...`);
+    }
+
+    // --- 15-SECOND LAUNCH DELAY ---
+    console.log(`⏳ [Launch Delay] Waiting 15s for ${newMint.slice(0, 8)} to survive initial dump...`);
     await new Promise(resolve => setTimeout(resolve, 15000));
 
-    // Re-check price/market cap via API to ensure it hasn't crashed to zero during the 15s wait
+    // Re-verify bonding curve hasn't completed or crashed after the delay
     try {
       const checkRes = await fetch(`https://frontend-api.pump.fun/coins/${newMint}`);
       if (checkRes.ok) {
         const checkData = await checkRes.json();
-        // If bonding curve progress or replies dropped dead, skip it
-        if (checkData.complete || checkData.virtual_sol_reserves < 3500000000) { // basic viability check
-          console.log(`🚫 [Delay Filter] Token lost momentum during 15s wait. Skipping.`);
+        if (checkData.complete) {
+          console.log(`🚫 [Delay Filter] Token already completed bonding curve. Skipping.`);
           isTrading = false;
           return;
         }
@@ -149,7 +164,7 @@ async function handleSnipe(signature) {
     const solToAllocate = Math.max(0.005, (balanceSol - 0.005) * ALLOCATION_PERCENTAGE);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
-    console.log(`🎯 [Target Survived Delay] Token Mint: ${newMint}`);
+    console.log(`🎯 [Target Passed All Elite Filters] Token Mint: ${newMint}`);
     console.log(`🚀 [Snipe Buying] Spending 20% (${solToAllocate.toFixed(4)} SOL)...`);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
@@ -162,7 +177,7 @@ async function handleSnipe(signature) {
         if (tokenUnits) {
           monitorAndExit(newMint, tokenUnits);
         } else {
-          console.log(`⚠️ Could not verify token balance units. Resetting trading lock.`);
+          console.log(`⚠️ Could not verify token units. Resetting trading lock.`);
           isTrading = false;
         }
       } catch (err) {
@@ -177,11 +192,11 @@ async function handleSnipe(signature) {
 }
 
 function startListener() {
-  console.log("⚡ [Smart Sniper + 15s Launch Delay Engine] Connecting...");
+  console.log("⚡ [Elite Sniper Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Listening and filtering with delay...");
+    console.log("🟢 [Connected] Scanning with Social Checks, 15s Delay, and 8% Trailing Exits...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
