@@ -25,7 +25,7 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
 // --- WAVE RIDING TARGETS ($4K - $50K Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 4000; // Updated minimum market cap threshold
+const MIN_MARKET_CAP_USD = 4000;
 const MAX_MARKET_CAP_USD = 50000;
 
 let tokenMetrics = new Map();
@@ -108,7 +108,6 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
   const dropFromPeak = ((position.peakMc - currentMc) / position.peakMc) * 100;
   const ageMs = Date.now() - position.entryTime;
 
-  // TAKE PROFIT: Hit +22% gain -> Sell 60% of position to lock in profit
   if (pnlPercentage >= 22 && !position.tookPartialProfit) {
     position.tookPartialProfit = true;
     const sellAmount = Number((TRADE_AMOUNT_SOL * 0.6).toFixed(4));
@@ -123,10 +122,9 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
     );
   }
 
-  // STOP LOSS / TRAILING EXIT
   const hitStopLoss = pnlPercentage <= -10;
   const hitTrailingDrop = position.tookPartialProfit && dropFromPeak >= 10;
-  const hitTimeout = ageMs > 240000; // 4 minutes max hold
+  const hitTimeout = ageMs > 240000;
 
   if (hitStopLoss || hitTrailingDrop || hitTimeout) {
     console.log(`🚪 Closing momentum position for ${mintAddress} (PnL: ${pnlPercentage.toFixed(2)}%). Selling...`);
@@ -172,9 +170,7 @@ function startWebSocketListener() {
         const solPriceUsd = 200;
         const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
 
-        // Hard safety check to ignore anything below $4K
-        if (marketCapUsd < MIN_MARKET_CAP_USD) return;
-
+        // Log tokens being scanned in the target range to verify activity
         if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
           let stats = tokenMetrics.get(mintAddress);
           if (!stats) {
@@ -185,12 +181,13 @@ function startWebSocketListener() {
           stats.buyCount += 1;
           stats.volumeSol += Number(event.solAmount || 0);
 
-          // WAVE BREAKOUT CRITERIA: Multiple rapid buys and solid volume
+          console.log(`👀 Evaluating ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL`);
+
           if (stats.buyCount >= 5 && stats.volumeSol >= 1.5) {
             processedMints.add(mintAddress);
             tokenMetrics.delete(mintAddress);
 
-            console.log(`🌊 MOMENTUM WAVE DETECTED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL - Executing Buy...`);
+            console.log(`🌊 MOMENTUM WAVE DETECTED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
 
             const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
@@ -243,7 +240,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Wave Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Volume breakout mode ($4K-$50K MC).`
+    `Status: Live scanning mode ($4K-$50K MC).`
   );
   startWebSocketListener();
 }
