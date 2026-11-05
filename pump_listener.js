@@ -292,6 +292,11 @@ function startListener() {
         { commitment: "confirmed" }
       ]
     }));
+
+    // Heartbeat every 60 seconds
+    setInterval(() => {
+      console.log(`💓 Still scanning... ${new Date().toLocaleTimeString()}`);
+    }, 60000);
   });
 
   ws.on('message', async (data) => {
