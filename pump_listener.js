@@ -155,8 +155,8 @@ async function runRpcScanCycle() {
       if (processedMints.has(signature)) continue;
       processedMints.add(signature);
 
-      // FIXED: Added maxSupportedTransactionVersion: 0 to support v0 transactions
-      const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+      // UPDATED: Upgraded to maxSupportedTransactionVersion: 1 to support v0 and v1 transactions
+      const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 1 });
       if (!tx || !tx.transaction) continue;
 
       const accountKeys = tx.transaction.message.accountKeys;
