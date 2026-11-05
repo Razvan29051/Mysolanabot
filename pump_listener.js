@@ -131,21 +131,23 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- API SCANNER LOOP WITH EXPLICIT ERROR REPORTING ---
+// --- API SCANNER LOOP WITH BROWSER HEADERS ---
 async function startScanner() {
   console.log('⚡ Pump.fun API Scanner Active - Scanning $3K-$35K Range...');
-  
-  // Run immediately on start
   runScanCycle();
-
-  // Then repeat every 4 seconds
   setInterval(runScanCycle, 4000);
 }
 
 async function runScanCycle() {
   try {
-    console.log('🔄 Fetching latest pump.fun coins...');
-    const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC');
+    const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Origin': 'https://pump.fun',
+        'Referer': 'https://pump.fun/'
+      }
+    });
     
     if (!res.ok) {
       console.log(`⚠️ API returned status: ${res.status}`);
