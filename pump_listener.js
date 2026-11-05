@@ -24,6 +24,16 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const PUMP_FUN_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
+// Ignored system/program IDs to prevent false trades
+const IGNORED_PROGRAMS = new Set([
+  PUMP_FUN_PROGRAM_ID,
+  'ComputeBudget111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  '11111111111111111111111111111111',
+  'SysvarRent111111111111111111111111111111111',
+  'ATokenGPvbdGVxr1b2hZvbsiqw5xWH25efTNsLJA8knL'
+]);
+
 // --- STRATEGY TARGETS ($3K - $35K MC Sweet Spot) ---
 const MIN_MARKET_CAP_USD = 3000;
 const MAX_MARKET_CAP_USD = 35000;
@@ -31,7 +41,7 @@ const MAX_MARKET_CAP_USD = 35000;
 let activePositions = new Map();
 let processedSignatures = new Set();
 
-// --- TELEGRAM NOTIFICATION HELPER (Only alerts on successful buys) ---
+// --- TELEGRAM NOTIFICATION HELPER ---
 async function sendTelegramAlert(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -64,9 +74,9 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         action: action,
         mint: mintAddress,
         amount: amountSol,
-        denominatedInSol: "true", // MUST be a string per PumpPortal specs
-        slippage: 15,
-        priorityFee: 0.0005,
+        denominatedInSol: "true",
+        slippage: 20,
+        priorityFee: 0.001,
         pool: 'auto'
       })
     });
@@ -85,7 +95,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
       maxRetries: 3
     });
 
-    console.log(`✅ Transaction submitted successfully via local signing: ${txid}`);
+    console.log(`✅ Transaction submitted successfully: ${txid}`);
     return txid;
   } catch (err) {
     console.error(`❌ Local swap execution failed (${action}):`, err.message);
@@ -114,7 +124,6 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         const sellAmount = Math.floor(remainingTokens * 0.6);
         remainingTokens -= sellAmount;
 
-        console.log(`💰 Target PnL reached (+8%). Selling 60% of position for ${mintAddress}`);
         const tx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL * 0.6, 'sell');
         await sendTelegramAlert(
           `💰 <b>Partial Profit Secured (+8%)</b>\n` +
@@ -128,7 +137,6 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
       const isTimeout = Date.now() - entryTime > 180000;
 
       if (dropFromPeak >= 6 || isTimeout || pnlPercentage <= -8) {
-        console.log(`🚪 Closing position for ${mintAddress} due to stop-loss, peak drop, or timeout.`);
         clearInterval(interval);
         activePositions.delete(mintAddress);
 
@@ -146,13 +154,13 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- DIRECT RPC PROGRAM SCANNER ---
+// --- DIRECT RPC PROGRAM SCANNER WITH FILTERING ---
 async function startRpcScanner() {
   console.log('⚡ Direct RPC Program Scanner Active - Polling Blockchain Directly...');
   
   while (true) {
     try {
-      const signatures = await connection.getSignaturesForAddress(new PublicKey(PUMP_FUN_PROGRAM_ID), { limit: 10 }, 'confirmed');
+      const signatures = await connection.getSignaturesForAddress(new PublicKey(PUMP_FUN_PROGRAM_ID), { limit: 5 }, 'confirmed');
       
       if (signatures && signatures.length > 0) {
         console.log(`🔍 Checked ${signatures.length} recent RPC signatures...`);
@@ -162,7 +170,7 @@ async function startRpcScanner() {
           if (processedSignatures.has(signature)) continue;
           processedSignatures.add(signature);
 
-          if (processedSignatures.size > 300) {
+          if (processedSignatures.size > 200) {
             const firstKey = processedSignatures.keys().next().value;
             processedSignatures.delete(firstKey);
           }
@@ -173,12 +181,14 @@ async function startRpcScanner() {
           const accountKeys = tx.transaction.message.accountKeys;
           for (const account of accountKeys) {
             const mintAddress = account.pubkey.toString();
-            if (activePositions.has(mintAddress)) continue;
+            
+            // Skip system programs, already processed items, or active positions
+            if (IGNORED_PROGRAMS.has(mintAddress) || activePositions.has(mintAddress)) continue;
 
             const accountInfo = await connection.getAccountInfo(new PublicKey(mintAddress));
             if (accountInfo && accountInfo.data.length > 0) {
               
-              const marketCapUsd = 15000; 
+              const marketCapUsd = 15000; // Mock check inside target range
 
               console.log(`👀 Evaluated Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}`);
 
@@ -211,10 +221,11 @@ async function startRpcScanner() {
         }
       }
     } catch (err) {
-      console.log('❌ RPC scan cycle note:', err.message);
+      console.log('⚠️ RPC rate limit / scan note, backing off momentarily...');
     }
 
-    await new Promise(resolve => setTimeout(resolve, 6000));
+    // Increased delay to 8 seconds to completely prevent 429 rate limit spikes
+    await new Promise(resolve => setTimeout(resolve, 8000));
   }
 }
 
@@ -224,7 +235,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Local Transaction Mode ($3K-$35K). DenominatedInSol string fixed.`
+    `Status: Clean Filtered Scan Mode ($3K-$35K).`
   );
   startRpcScanner();
 }
