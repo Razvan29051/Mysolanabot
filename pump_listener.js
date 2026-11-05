@@ -138,22 +138,25 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
   }
 }
 
-// --- WEBSOCKET ENGINE ---
+// --- WEBSOCKET ENGINE WITH VERBOSE LOGGING ---
 function startWebSocketListener() {
   console.log('⚡ Connecting to PumpPortal Real-Time Engine...');
   
   globalWs = new WebSocket('wss://pumpportal.fun/api/data');
 
   globalWs.on('open', () => {
-    console.log('🟢 Connected. Listening for active token creations and wave movements...');
+    console.log('🟢 Connected to PumpPortal. Subscribing to new token feed...');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
   globalWs.on('message', async (data) => {
     try {
       const event = JSON.parse(data.toString());
-      if (!event || !event.mint) return;
+      
+      // VERBOSE LOG: Prints incoming stream events so you see activity in Railway
+      console.log(`📥 Stream Event Received -> Mint: ${event.mint ? event.mint.slice(0, 6) : 'N/A'} | Type: ${event.txType || 'creation'} | MC: $${event.usd_market_cap || event.marketCapUsd || 'unknown'}`);
 
+      if (!event || !event.mint) return;
       const mintAddress = event.mint;
 
       if (activePositions.has(mintAddress)) {
@@ -165,24 +168,21 @@ function startWebSocketListener() {
       const solPriceUsd = 200;
       const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
 
+      console.log(`🔎 Evaluating token ${mintAddress.slice(0, 6)}... Market Cap: $${marketCapUsd.toFixed(0)}`);
+
       if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
         let stats = tokenMetrics.get(mintAddress);
         if (!stats) {
           stats = { buyCount: 0, volumeSol: 0 };
           tokenMetrics.set(mintAddress, stats);
-
-          globalWs.send(JSON.stringify({
-            method: 'subscribeTokenTrade',
-            keys: [mintAddress]
-          }));
         }
 
         stats.buyCount += 1;
         stats.volumeSol += Number(event.solAmount || 0.2);
 
-        console.log(`👀 Watching Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL`);
+        console.log(`🎯 MATCHED SWEET SPOT! Token: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount}`);
 
-        if (stats.buyCount >= 3 && stats.volumeSol >= 1.0 && !processedMints.has(mintAddress)) {
+        if (stats.buyCount >= 2 && stats.volumeSol >= 0.5 && !processedMints.has(mintAddress)) {
           processedMints.add(mintAddress);
           tokenMetrics.delete(mintAddress);
 
@@ -211,7 +211,7 @@ function startWebSocketListener() {
         }
       }
     } catch (err) {
-      console.error('❌ Error in stream parser:', err.message);
+      console.error('❌ Error parsing stream message:', err.message);
     }
   });
 
@@ -231,7 +231,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Wave Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Dual-Stream Scanner Active ($4K-$50K MC).`
+    `Status: Verbose Log Scanner Active ($4K-$50K MC).`
   );
   startWebSocketListener();
 }
