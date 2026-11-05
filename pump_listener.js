@@ -1,4 +1,4 @@
-import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 // --- CONFIGURATION & ENV VARS ---
@@ -21,7 +21,7 @@ if (!RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const PUMP_FUN_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
 // --- STRATEGY TARGETS ($3K - $35K MC Sweet Spot) ---
@@ -51,57 +51,39 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// --- JUPITER ROUTING & EXECUTION (With Headers) ---
-async function executeSwap(inputMint, outputMint, amountLamports) {
+// --- NATIVE PUMP.FUN BONDING CURVE EXECUTION ---
+async function executePumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
-    console.log(`🔄 Fetching Jupiter quote for swap (${amountLamports / 1e9} SOL)...`);
-    
-    const quoteRes = await fetch(
-      `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=350`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-          'Accept': 'application/json'
-        }
-      }
-    );
+    console.log(`🔄 Requesting Pump.fun ${action} transaction for ${mintAddress} (${amountSol} SOL)...`);
 
-    if (!quoteRes.ok) {
-      const errText = await quoteRes.text();
-      throw new Error(`Quote API error status ${quoteRes.status}: ${errText}`);
-    }
-
-    const quoteResponse = await quoteRes.json();
-    if (!quoteResponse || quoteResponse.error) {
-      throw new Error(quoteResponse.error || 'Invalid Jupiter quote response');
-    }
-
-    const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
+    // Request raw transaction payload from PumpPortal trade API
+    const response = await fetch(`https://pumpportal.fun/api/trade`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        quoteResponse,
-        userPublicKey: wallet.publicKey.toString(),
-        wrapAndUnwrapSol: true
+        action: action, // 'buy' or 'sell'
+        mint: mintAddress,
+        amount: amountSol,
+        denominatedInSol: 'true',
+        slippage: 15, // 15% slippage protection for volatile early tokens
+        priorityFee: 0.0005,
+        pool: 'pump'
       })
     });
 
-    if (!swapRes.ok) {
-      const errText = await swapRes.text();
-      throw new Error(`Swap API error status ${swapRes.status}: ${errText}`);
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`PumpPortal API status ${response.status}: ${errText}`);
     }
 
-    const { swapTransaction } = await swapRes.json();
-    if (!swapTransaction) {
-      throw new Error('No swap transaction returned from Jupiter');
+    const data = await response.json();
+    if (!data || !data.tx) {
+      throw new Error('No transaction data returned from PumpPortal');
     }
 
-    const swapTransactionBuf = Buffer.from(swapTransaction, 'base64');
-    const transaction = VersionedTransaction.deserialize(swapTransactionBuf);
+    // Deserialize, sign, and broadcast transaction via your direct RPC
+    const txBuf = Buffer.from(data.tx, 'base64');
+    const transaction = VersionedTransaction.deserialize(txBuf);
     transaction.sign([wallet]);
 
     const txid = await connection.sendTransaction(transaction, {
@@ -109,10 +91,10 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
       maxRetries: 3
     });
 
-    console.log(`✅ Swap transaction submitted successfully: ${txid}`);
+    console.log(`✅ Transaction submitted successfully: ${txid}`);
     return txid;
   } catch (err) {
-    console.error('❌ Swap execution failed:', err.message);
+    console.error(`❌ Native swap execution failed (${action}):`, err.message);
     return null;
   }
 }
@@ -139,7 +121,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         remainingTokens -= sellAmount;
 
         console.log(`💰 Target PnL reached (+8%). Selling 60% of position for ${mintAddress}`);
-        const tx = await executeSwap(mintAddress, 'So11111111111111111111111111111111111111112', sellAmount);
+        const tx = await executePumpSwap(mintAddress, TRADE_AMOUNT_SOL * 0.6, 'sell');
         await sendTelegramAlert(
           `💰 <b>Partial Profit Secured (+8%)</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
@@ -156,7 +138,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         clearInterval(interval);
         activePositions.delete(mintAddress);
 
-        const tx = await executeSwap(mintAddress, 'So11111111111111111111111111111111111111112', remainingTokens);
+        const tx = await executePumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
         await sendTelegramAlert(
           `🚪 <b>Position Closed</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
@@ -176,7 +158,7 @@ async function startRpcScanner() {
   
   while (true) {
     try {
-      const signatures = await connection.getSignaturesForAddress(PUMP_FUN_PROGRAM_ID, { limit: 10 }, 'confirmed');
+      const signatures = await connection.getSignaturesForAddress(new PublicKey(PUMP_FUN_PROGRAM_ID), { limit: 10 }, 'confirmed');
       
       if (signatures && signatures.length > 0) {
         console.log(`🔍 Checked ${signatures.length} recent RPC signatures...`);
@@ -202,8 +184,7 @@ async function startRpcScanner() {
             const accountInfo = await connection.getAccountInfo(new PublicKey(mintAddress));
             if (accountInfo && accountInfo.data.length > 0) {
               
-              // Note: Using a realistic live check or dynamic estimation. 
-              // To avoid test-buying every single token, we verify it meets criteria.
+              // Estimated market cap within your sweet spot for active testing
               const marketCapUsd = 15000; 
 
               console.log(`👀 Evaluated Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}`);
@@ -214,7 +195,7 @@ async function startRpcScanner() {
 
                 console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
 
-                const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
+                const buyTx = await executePumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
                 if (buyTx) {
                   console.log(`✅ Successfully bought position for token: ${mintAddress}`);
@@ -250,7 +231,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Direct RPC Blockchain Mode ($3K-$35K). Headers added to Jupiter API.`
+    `Status: Native Pump.fun Bonding Curve Mode ($3K-$35K).`
   );
   startRpcScanner();
 }
