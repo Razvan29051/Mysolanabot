@@ -20,12 +20,18 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- RISK MANAGEMENT (Trailing Stop & -8% Protection) ---
-const INITIAL_STOP_LOSS_PERCENT = -8.0; // Hard stop-loss at -8% from entry
-const TRAILING_DROP_PERCENT = -7.0;    // Once in profit, trail and exit if it drops 7% from peak
-const TAKE_PROFIT_PERCENT = 45.0;      // Hard profit target
+// --- STRICT FILTERS TO BLOCK SHITCOINS ---
+const MIN_MARKET_CAP_USD = 15000;  // Must have grown past $15K (ignoring instant dead rugs)
+const MAX_MARKET_CAP_USD = 80000;  
+const MIN_BUY_TRANSACTIONS = 4;    // Must have at least 4 independent buy orders during the check window
+
+// --- RISK MANAGEMENT ---
+const STOP_LOSS_PERCENT = -8.0;     
+const TRAILING_DROP_PERCENT = -7.0;    
+const TAKE_PROFIT_PERCENT = 45.0;      
 
 let activePositions = new Map(); 
+let pendingTokens = new Map();     // Accumulates early trades for a token before deciding to buy
 let processedMints = new Set();
 let globalWs = null;
 
@@ -85,7 +91,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
 
 // --- LIVE WEBSOCKET ENGINE ---
 function startWebSocketListener() {
-  process.stdout.write('⚡ Connecting to PumpPortal Stream...\n');
+  process.stdout.write('⚡ Connecting to PumpPortal Filter Stream...\n');
   
   const wsUrl = PUMP_API_KEY 
     ? `wss://pumpportal.fun/api/data?api-key=${PUMP_API_KEY}` 
@@ -94,7 +100,7 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Subscribing to bonding curve momentum feeds...\n');
+    process.stdout.write('🟢 Connected! Subscribing to token creation feed...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -109,7 +115,7 @@ function startWebSocketListener() {
       const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0.03);
       const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves * solPriceUsd * 5);
 
-      // 1. ACTIVE POSITION MANAGEMENT WITH TRAILING STOP & -8% SL
+      // 1. ACTIVE POSITION MANAGEMENT (Stop-Loss / Take-Profit)
       if (activePositions.has(mintAddress) && currentMc > 0) {
         const pos = activePositions.get(mintAddress);
         
@@ -123,10 +129,10 @@ function startWebSocketListener() {
 
         let exitReason = null;
 
-        if (pnlPercent <= INITIAL_STOP_LOSS_PERCENT) {
+        if (pnlPercent <= STOP_LOSS_PERCENT) {
           exitReason = `Stop-Loss Triggered (${pnlPercent.toFixed(1)}%)`;
         } else if (pnlPercent > 10 && dropFromPeak <= TRAILING_DROP_PERCENT) {
-          exitReason = `Trailing Profit Lock Triggered (Peak PnL: +${((pos.highestMc - pos.entryMc) / pos.entryMc * 100).toFixed(1)}%)`;
+          exitReason = `Trailing Profit Lock Triggered`;
         } else if (pnlPercent >= TAKE_PROFIT_PERCENT) {
           exitReason = `Take-Profit Target Reached (+${pnlPercent.toFixed(1)}%)`;
         }
@@ -142,33 +148,66 @@ function startWebSocketListener() {
               `Mint: <code>${mintAddress}</code>\n` +
               `Reason: <b>${exitReason}</b>\n` +
               `Final PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
-              `Exit MC: <b>$${currentMc.toFixed(0)}</b>\n` +
-              `<a href="https://solscan.io/tx/${sellTx}">View Tx on Solscan</a>`
+              `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
             );
           }
         }
+        return;
       }
 
-      // 2. INSTANT MOMENTUM ENTRY TRIGGER
-      if (!processedMints.has(mintAddress) && currentMc > 0) {
-        processedMints.add(mintAddress);
-
-        process.stdout.write(`🚀 SNIPING MOMENTUM LAUNCH: ${mintAddress.slice(0, 6)}... | Est. MC: ~$${currentMc.toFixed(0)}\n`);
-        const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
-
-        if (buyTx) {
-          activePositions.set(mintAddress, {
-            entryMc: currentMc,
-            highestMc: currentMc,
-            buyTime: Date.now()
+      // 2. ACCUMULATION & FILTER GATE FOR NEW TOKENS
+      if (!processedMints.has(mintAddress)) {
+        if (!pendingTokens.has(mintAddress)) {
+          // Register token and evaluate it after a short 8-second observation window
+          pendingTokens.set(mintAddress, {
+            buys: event.txType === 'buy' ? 1 : 0,
+            lastMc: currentMc
           });
 
-          await sendTelegramAlert(
-            `🚀 <b>Momentum Snipe Entry!</b>\n` +
-            `Mint: <code>${mintAddress}</code>\n` +
-            `Entry MC: <b>~$${currentMc.toFixed(0)}</b>\n` +
-            `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-          );
+          setTimeout(async () => {
+            if (processedMints.has(mintAddress)) return;
+            const tokenStats = pendingTokens.get(mintAddress);
+            if (!tokenStats) return;
+
+            process.stdout.write(`🔍 Evaluating Token: ${mintAddress.slice(0, 6)}... | MC: $${tokenStats.lastMc.toFixed(0)} | Buys: ${tokenStats.buys}\n`);
+
+            // Apply filters: Check if market cap and buy count match criteria
+            if (tokenStats.lastMc >= MIN_MARKET_CAP_USD && tokenStats.lastMc <= MAX_MARKET_CAP_USD && tokenStats.buys >= MIN_BUY_TRANSACTIONS) {
+              processedMints.add(mintAddress);
+              pendingTokens.delete(mintAddress);
+
+              process.stdout.write(`🚀 FILTER PASSED - SNIPING: ${mintAddress.slice(0, 6)}... | MC: $${tokenStats.lastMc.toFixed(0)}\n`);
+              const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
+
+              if (buyTx) {
+                activePositions.set(mintAddress, {
+                  entryMc: tokenStats.lastMc,
+                  highestMc: tokenStats.lastMc,
+                  buyTime: Date.now()
+                });
+
+                await sendTelegramAlert(
+                  `🚀 <b>Filtered Quality Snipe!</b>\n` +
+                  `Mint: <code>${mintAddress}</code>\n` +
+                  `Entry MC: <b>~$${tokenStats.lastMc.toFixed(0)}</b>\n` +
+                  `Confirmed Buys: <b>${tokenStats.buys}</b>\n` +
+                  `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+                );
+              }
+            } else {
+              process.stdout.write(`🗑️ REJECTED SHITCOIN: ${mintAddress.slice(0, 6)}... (MC: $${tokenStats.lastMc.toFixed(0)}, Buys: ${tokenStats.buys})\n`);
+              processedMints.add(mintAddress); // Ignore it permanently
+              pendingTokens.delete(mintAddress);
+            }
+          }, 8000); // 8-second observation window
+        } else {
+          // Update stats during the observation window
+          let tokenStats = pendingTokens.get(mintAddress);
+          if (tokenStats) {
+            if (event.txType === 'buy') tokenStats.buys += 1;
+            tokenStats.lastMc = currentMc;
+            pendingTokens.set(mintAddress, tokenStats);
+          }
         }
       }
     } catch (err) {
@@ -185,7 +224,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('⚡ <b>Pump.fun Momentum Bot Online (-8% SL & Trailing Stop)</b>');
+  await sendTelegramAlert('⚡ <b>Pump.fun Filter-Gated Bot Online (No Shitcoins)</b>');
   startWebSocketListener();
 }
 
