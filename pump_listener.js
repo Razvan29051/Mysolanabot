@@ -8,6 +8,11 @@ const RAW_PRIVATE_KEY = process.env.PRIVATE_KEY || process.env.BOT_PRIVATE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
+if (!RPC_ENDPOINT) {
+  console.error('❌ CRITICAL ERROR: RPC_ENDPOINT is missing in Railway variables!');
+  process.exit(1);
+}
+
 if (!RAW_PRIVATE_KEY) {
   console.error('❌ CRITICAL ERROR: Private key is missing in Railway variables!');
   process.exit(1);
@@ -16,6 +21,7 @@ if (!RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
+const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
 // --- STRATEGY TARGETS ($3K - $35K MC Sweet Spot) ---
@@ -23,9 +29,9 @@ const MIN_MARKET_CAP_USD = 3000;
 const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
-let processedMints = new Set();
+let processedSignatures = new Set();
 
-// --- TELEGRAM NOTIFICATION HELPER ---
+// --- TELEGRAM NOTIFICATION HELPER (Only sends on actual buy/exit) ---
 async function sendTelegramAlert(message) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
@@ -48,6 +54,7 @@ async function sendTelegramAlert(message) {
 // --- JUPITER ROUTING & EXECUTION ---
 async function executeSwap(inputMint, outputMint, amountLamports) {
   try {
+    console.log(`🔄 Fetching Jupiter quote for swap (${amountLamports / 1e9} SOL)...`);
     const quoteResponse = await fetch(
       `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=350`
     ).then(res => res.json());
@@ -75,6 +82,7 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
       maxRetries: 3
     });
 
+    console.log(`✅ Swap transaction submitted successfully: ${txid}`);
     return txid;
   } catch (err) {
     console.error('❌ Swap execution failed:', err.message);
@@ -89,6 +97,8 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   let remainingTokens = tokenAmount;
   let tookPartialProfit = false;
 
+  console.log(`📊 Initializing position monitor for token: ${mintAddress}`);
+
   const interval = setInterval(async () => {
     try {
       const currentPrice = buyPrice * (1 + (Math.random() * 0.35 - 0.08)); 
@@ -101,6 +111,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         const sellAmount = Math.floor(remainingTokens * 0.6);
         remainingTokens -= sellAmount;
 
+        console.log(`💰 Target PnL reached (+8%). Selling 60% of position for ${mintAddress}`);
         const tx = await executeSwap(mintAddress, 'So11111111111111111111111111111111111111112', sellAmount);
         await sendTelegramAlert(
           `💰 <b>Partial Profit Secured (+8%)</b>\n` +
@@ -114,6 +125,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
       const isTimeout = Date.now() - entryTime > 180000;
 
       if (dropFromPeak >= 6 || isTimeout || pnlPercentage <= -8) {
+        console.log(`🚪 Closing position for ${mintAddress} due to stop-loss, peak drop, or timeout.`);
         clearInterval(interval);
         activePositions.delete(mintAddress);
 
@@ -126,83 +138,91 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         );
       }
     } catch (err) {
-      console.error(`Error monitoring position:`, err.message);
+      console.error(`❌ Error monitoring position ${mintAddress}:`, err.message);
     }
   }, 4000);
 }
 
-// --- SAFE SCANNER WITH VISIBLE LOGGING ---
-async function startScanner() {
-  console.log('⚡ Safe Scanner Active - Scanning $3K-$35K Range...');
-  runScanCycle();
-  setInterval(runScanCycle, 5000);
-}
-
-async function runScanCycle() {
-  try {
-    const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=DESC', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Origin': 'https://pump.fun',
-        'Referer': 'https://pump.fun/'
-      }
-    });
-
-    if (!res.ok) {
-      console.log(`⚠️ API status: ${res.status}`);
-      return;
-    }
-
-    const coins = await res.json();
-    if (!Array.isArray(coins)) return;
-
-    console.log(`🔍 Checked ${coins.length} coins. Scanning for $3K-$35K targets...`);
-
-    for (const coin of coins) {
-      const mintAddress = coin.mint;
-      if (!mintAddress) continue;
-
-      const solPriceUsd = 200;
-      const marketCapUsd = coin.usd_market_cap || ((coin.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
-
-      // Print tokens that are close or inside the range for visibility
-      if (marketCapUsd >= 1000 && marketCapUsd <= 50000) {
-        console.log(`👀 Seen: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}`);
-      }
-
-      if (processedMints.has(mintAddress) || activePositions.has(mintAddress)) continue;
-
-      if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
-        processedMints.add(mintAddress);
-        console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
-
-        await sendTelegramAlert(
-          `🎯 <b>Momentum Target Found ($3K-$35K MC)!</b>\n` +
-          `Mint: <code>${mintAddress}</code>\n` +
-          `Market Cap: $${marketCapUsd.toFixed(0)}\n` +
-          `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
-        );
-
-        activePositions.set(mintAddress, true);
-        const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
-
-        if (buyTx) {
-          await sendTelegramAlert(
-            `✅ <b>Position Entered</b>\n` +
-            `Mint: <code>${mintAddress}</code>\n` +
-            `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-          );
-          monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
-        } else {
-          activePositions.delete(mintAddress);
-        }
+// --- DIRECT RPC SCANNER WITH VERBOSE LOGGING ---
+async function startRpcScanner() {
+  console.log('⚡ Rate-Limited RPC Scanner Active - Polling Pump.fun Program...');
+  
+  while (true) {
+    try {
+      const signatures = await connection.getSignaturesForAddress(PUMP_FUN_PROGRAM_ID, { limit: 5 }, 'confirmed');
+      
+      if (signatures && signatures.length > 0) {
+        console.log(`🔍 Checked ${signatures.length} recent RPC signatures. Evaluating accounts...`);
         
-        break;
+        for (const sigInfo of signatures) {
+          const signature = sigInfo.signature;
+          if (processedSignatures.has(signature)) continue;
+          processedSignatures.add(signature);
+
+          if (processedSignatures.size > 200) {
+            const firstKey = processedSignatures.keys().next().value;
+            processedSignatures.delete(firstKey);
+          }
+
+          const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 1 });
+          if (!tx || !tx.transaction) continue;
+
+          const accountKeys = tx.transaction.message.accountKeys;
+          for (const account of accountKeys) {
+            const mintAddress = account.pubkey.toString();
+            if (activePositions.has(mintAddress)) continue;
+
+            const accountInfo = await connection.getAccountInfo(new PublicKey(mintAddress));
+            if (accountInfo && accountInfo.data.length > 0) {
+              
+              let marketCapUsd = 0;
+              try {
+                const priceCheck = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`, {
+                  headers: { 'User-Agent': 'Mozilla/5.0' }
+                });
+                if (priceCheck.ok) {
+                  const coinData = await priceCheck.json();
+                  const solPriceUsd = 200;
+                  marketCapUsd = coinData.usd_market_cap || ((coinData.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
+                }
+              } catch (e) {
+                marketCapUsd = 5000;
+              }
+
+              console.log(`👀 Evaluated Token: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
+
+              if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
+                processedSignatures.add(mintAddress);
+                activePositions.set(mintAddress, true);
+
+                console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
+
+                const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
+
+                if (buyTx) {
+                  console.log(`✅ Successfully bought position for token: ${mintAddress}`);
+                  await sendTelegramAlert(
+                    `✅ <b>Position Entered & Bought</b>\n` +
+                    `Mint: <code>${mintAddress}</code>\n` +
+                    `Entry MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
+                    `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+                  );
+                  monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
+                } else {
+                  console.log(`❌ Buy failed for ${mintAddress}, removing from active positions.`);
+                  activePositions.delete(mintAddress);
+                }
+                break;
+              }
+            }
+          }
+        }
       }
+    } catch (err) {
+      console.error('❌ RPC scan cycle note:', err.message);
     }
-  } catch (err) {
-    console.error('Scan error:', err.message);
+
+    await new Promise(resolve => setTimeout(resolve, 6000));
   }
 }
 
@@ -212,9 +232,9 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Safe Scan Mode ($3K-$35K).`
+    `Status: Verbose Console Log Mode ($3K-$35K). Telegram alerts restricted to buys only.`
   );
-  startScanner();
+  startRpcScanner();
 }
 
 main();
