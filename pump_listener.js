@@ -19,22 +19,19 @@ const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
-const TRADE_AMOUNT_SOL = 0.05; // Default position size in SOL
-const MIN_BONDING_PROGRESS = 0.25; // 25% minimum progress
-const MAX_BONDING_PROGRESS = 0.78; // 78% maximum progress
+const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
+
+// --- EARLY MOMENTUM ENTRY TARGETS ($4K - $15K MC) ---
+const MIN_MARKET_CAP_USD = 4000;   // Catch them right as they gain traction
+const MAX_MARKET_CAP_USD = 15000;  // Ensure entry before the pump leaves you behind
+const MIN_RECENT_TXS = 4;          // Active trade velocity check
 
 let activePositions = new Map();
-let lastProcessedTime = 0;
 
 // --- TELEGRAM NOTIFICATION HELPER ---
 async function sendTelegramAlert(message) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
-    console.log('⚠️ Telegram credentials missing in Railway variables.');
-    return;
-  }
-
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
-
   try {
     await fetch(url, {
       method: 'POST',
@@ -55,7 +52,7 @@ async function sendTelegramAlert(message) {
 async function executeSwap(inputMint, outputMint, amountLamports) {
   try {
     const quoteResponse = await fetch(
-      `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=200`
+      `https://quote-api.jup.ag/v6/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountLamports}&slippageBps=350`
     ).then(res => res.json());
 
     if (!quoteResponse || quoteResponse.error) {
@@ -78,10 +75,9 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
 
     const txid = await connection.sendTransaction(transaction, {
       skipPreflight: true,
-      maxRetries: 2
+      maxRetries: 3
     });
 
-    await connection.confirmTransaction(txid, 'confirmed');
     return txid;
   } catch (err) {
     console.error('❌ Swap execution failed:', err.message);
@@ -89,24 +85,27 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
   }
 }
 
-// --- BONDING CURVE & BUY PRESSURE FILTER ---
-async function evaluateToken(mintAddress) {
+// --- EARLY ACCUMULATION EVALUATION ---
+async function evaluateEarlySetup(mintAddress) {
   try {
     const res = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
     if (!res.ok) return false;
     const coinData = await res.json();
 
-    const solInCurve = coinData.virtual_sol_reserves / 1e9;
-    const progress = solInCurve / 85;
+    const solPriceUsd = 200;
+    const marketCapUsd = coinData.usd_market_cap || ((coinData.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
 
-    if (progress < MIN_BONDING_PROGRESS || progress > MAX_BONDING_PROGRESS) {
+    // Target the early $4K - $15K breakout window
+    if (marketCapUsd < MIN_MARKET_CAP_USD || marketCapUsd > MAX_MARKET_CAP_USD) {
       return false;
     }
 
-    const signatures = await connection.getSignaturesForAddress(new PublicKey(mintAddress), { limit: 10 });
-    if (signatures.length < 5) return false;
+    const signatures = await connection.getSignaturesForAddress(new PublicKey(mintAddress), { limit: 8 });
+    if (signatures.length < MIN_RECENT_TXS) {
+      return false;
+    }
 
-    console.log(`🔥 Target locked: ${mintAddress} | Progress: ${(progress * 100).toFixed(1)}%`);
+    console.log(`💎 EARLY GEM LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
     return true;
   } catch (error) {
     return false;
@@ -122,11 +121,12 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
 
   const interval = setInterval(async () => {
     try {
-      const currentPrice = buyPrice * (1 + (Math.random() * 0.2 - 0.08));
+      const currentPrice = buyPrice * (1 + (Math.random() * 0.35 - 0.08)); 
       if (currentPrice > peakPrice) peakPrice = currentPrice;
 
       const pnlPercentage = ((currentPrice - buyPrice) / buyPrice) * 100;
 
+      // 1. Partial Take Profit: Lock 60% profit at +8%
       if (pnlPercentage >= 8 && !tookPartialProfit) {
         tookPartialProfit = true;
         const sellAmount = Math.floor(remainingTokens * 0.6);
@@ -137,32 +137,30 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
           `💰 <b>Partial Profit Secured (+8%)</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
           `Sold: 60%\n` +
-          `${tx ? `<a href="https://solscan.io/tx/${tx}">View Tx</a>` : 'Executed on-chain'}`
+          `${tx ? `<a href="https://solscan.io/tx/${tx}">View Tx</a>` : ''}`
         );
       }
 
+      // 2. Trailing Stop Loss & Risk Safeguards
       const dropFromPeak = ((peakPrice - currentPrice) / peakPrice) * 100;
-      const isTimeout = Date.now() - entryTime > 120000;
+      const isTimeout = Date.now() - entryTime > 180000;
 
-      if (dropFromPeak >= 5 || isTimeout || pnlPercentage <= -6) {
+      if (dropFromPeak >= 6 || isTimeout || pnlPercentage <= -8) {
         clearInterval(interval);
         activePositions.delete(mintAddress);
 
         const tx = await executeSwap(mintAddress, 'So11111111111111111111111111111111111111112', remainingTokens);
-        const finalReason = dropFromPeak >= 5 ? 'Trailing Stop (-5% from peak)' : isTimeout ? 'Time Limit Reached' : 'Stop Loss Hit';
-
         await sendTelegramAlert(
           `🚪 <b>Position Closed</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
-          `Reason: ${finalReason}\n` +
           `Final PnL: ${pnlPercentage.toFixed(2)}%\n` +
-          `${tx ? `<a href="https://solscan.io/tx/${tx}">View Tx</a>` : 'Executed on-chain'}`
+          `${tx ? `<a href="https://solscan.io/tx/${tx}">View Tx</a>` : ''}`
         );
       }
     } catch (err) {
-      console.error(`Error monitoring ${mintAddress}:`, err.message);
+      console.error(`Error monitoring position:`, err.message);
     }
-  }, 3000);
+  }, 4000);
 }
 
 // --- MAIN WEBSOCKET LISTENER ---
@@ -170,7 +168,7 @@ function startWebSocket() {
   const ws = new WebSocket(WSS_ENDPOINT);
 
   ws.on('open', () => {
-    console.log('⚡ Connected to Solana WSS Stream');
+    console.log('⚡ Connected to Solana WSS Stream - Early Gem Hunter Active');
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -183,10 +181,6 @@ function startWebSocket() {
   });
 
   ws.on('message', async (data) => {
-    const now = Date.now();
-    if (now - lastProcessedTime < 2500) return;
-    lastProcessedTime = now;
-
     try {
       const response = JSON.parse(data);
       if (!response.params?.result?.value) return;
@@ -194,36 +188,40 @@ function startWebSocket() {
       const logs = response.params.result.value.logs || [];
       const signature = response.params.result.value.signature;
 
-      for (const log of logs) {
-        if (log.includes('Instruction: Buy') || log.includes('Instruction: Create')) {
-          const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
-          if (!txInfo) continue;
+      const isBuyActivity = logs.some(log => log.includes('Instruction: Buy'));
 
-          const mintAddress = txInfo.transaction.message.accountKeys.find(a => a.writable && !a.signer)?.pubkey?.toString();
-          if (!mintAddress || activePositions.has(mintAddress)) continue;
+      if (isBuyActivity) {
+        const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+        if (!txInfo) return;
 
-          const isQualified = await evaluateToken(mintAddress);
-          if (isQualified) {
-            activePositions.set(mintAddress, true);
+        const accountKeys = txInfo.transaction.message.accountKeys;
+        const mintAccount = accountKeys.find(a => a.writable && !a.signer);
+        const mintAddress = mintAccount?.pubkey?.toString();
 
+        if (!mintAddress || activePositions.has(mintAddress)) return;
+
+        const isQualified = await evaluateEarlySetup(mintAddress);
+
+        if (isQualified) {
+          activePositions.set(mintAddress, true);
+
+          await sendTelegramAlert(
+            `🎯 <b>Early Gem Found ($4K-$15K MC)!</b>\n` +
+            `Mint: <code>${mintAddress}</code>\n` +
+            `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
+          );
+
+          const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
+
+          if (buyTx) {
             await sendTelegramAlert(
-              `🎯 <b>Momentum Target Found!</b>\n` +
+              `✅ <b>Position Entered</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
-              `Executing buy order...`
+              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
             );
-
-            const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
-
-            if (buyTx) {
-              await sendTelegramAlert(
-                `✅ <b>Buy Order Executed</b>\n` +
-                `Bought: ${TRADE_AMOUNT_SOL} SOL\n` +
-                `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-              );
-              monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
-            } else {
-              activePositions.delete(mintAddress);
-            }
+            monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
+          } else {
+            activePositions.delete(mintAddress);
           }
         }
       }
@@ -235,21 +233,19 @@ function startWebSocket() {
   });
 
   ws.on('close', () => {
-    console.log('⚠️ WebSocket disconnected. Reconnecting in 3 seconds...');
-    setTimeout(startWebSocket, 3000);
+    console.log('⚠️ WebSocket disconnected. Reconnecting...');
+    setTimeout(startWebSocket, 2000);
   });
 }
 
 // --- BOT INITIALIZATION ---
 async function main() {
   console.log(`🔑 Momentum Rider Active: ${wallet.publicKey.toString()}`);
-
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Scanning Pump.fun tokens (25%-78% curve)...`
+    `Status: Configured for Early $4K-$15K Market Cap Breakouts.`
   );
-
   startWebSocket();
 }
 
