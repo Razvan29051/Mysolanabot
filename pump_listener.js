@@ -26,7 +26,8 @@ const MIN_MARKET_CAP_USD = 4000;
 const MAX_MARKET_CAP_USD = 15000;
 
 let activePositions = new Map();
-let lastCheckTime = 0; // Rate limit throttle tracker
+let lastCheckTime = 0;
+let reconnectAttempts = 0;
 
 // --- TELEGRAM NOTIFICATION HELPER ---
 async function sendTelegramAlert(message) {
@@ -85,10 +86,9 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
   }
 }
 
-// --- LIGHTWEIGHT API EVALUATION (NO RPC SPAM) ---
+// --- LIGHTWEIGHT API EVALUATION ---
 async function evaluateEarlySetup(mintAddress) {
   try {
-    // Using Pump.fun frontend API directly avoids heavy RPC calls and 429 errors
     const res = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
     if (!res.ok) return false;
     const coinData = await res.json();
@@ -162,6 +162,7 @@ function startWebSocket() {
 
   ws.on('open', () => {
     console.log('⚡ Connected to Solana WSS Stream - Rate-Limit Protected');
+    reconnectAttempts = 0; // Reset backoff on success
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -175,9 +176,8 @@ function startWebSocket() {
 
   ws.on('message', async (data) => {
     try {
-      // Throttle: Process at most 1 log every 1500ms to prevent 429 rate limits
       const now = Date.now();
-      if (now - lastCheckTime < 1500) return;
+      if (now - lastCheckTime < 2000) return; // Increased throttle to 2s to protect RPC limits
       lastCheckTime = now;
 
       const response = JSON.parse(data);
@@ -231,8 +231,11 @@ function startWebSocket() {
   });
 
   ws.on('close', () => {
-    console.log('⚠️ WebSocket disconnected. Reconnecting...');
-    setTimeout(startWebSocket, 2000);
+    reconnectAttempts++;
+    // Exponential backoff: Wait longer with each consecutive failure (e.g., 5s, 10s, 15s...)
+    const delay = Math.min(reconnectAttempts * 5000, 30000);
+    console.log(`⚠️ WebSocket disconnected. Reconnecting in ${delay / 1000} seconds...`);
+    setTimeout(startWebSocket, delay);
   });
 }
 
@@ -242,7 +245,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Rate-limit protected & scanning for breakouts.`
+    `Status: Safe backoff mode active & scanning breakouts.`
   );
   startWebSocket();
 }
