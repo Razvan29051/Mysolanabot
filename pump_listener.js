@@ -20,20 +20,12 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- LOW-CAP HIGH-MOMENTUM TARGETS ($10K - $60K) ---
-const MIN_MARKET_CAP_USD = 10000;  // Catch them early right out of the initial launch zone
-const MAX_MARKET_CAP_USD = 60000;  
-
-// --- BUY POWER VELOCITY THRESHOLDS ---
-const MIN_BUY_VOLUME_SOL = 0.10;   // Lower threshold for early caps to catch momentum immediately
-const BUY_TO_SELL_RATIO = 1.5;     // Buy volume must be 1.5x higher than sell volume
-
-// --- RISK MANAGEMENT ---
-const STOP_LOSS_PERCENT = -12;     // Slightly tighter stop loss for low caps (-12%)
-const TAKE_PROFIT_PERCENT = 50;    // Higher reward target (+50%)
+// --- RISK MANAGEMENT (Trailing Stop & -8% Protection) ---
+const INITIAL_STOP_LOSS_PERCENT = -8.0; // Hard stop-loss at -8% from entry
+const TRAILING_DROP_PERCENT = -7.0;    // Once in profit, trail and exit if it drops 7% from peak
+const TAKE_PROFIT_PERCENT = 45.0;      // Hard profit target
 
 let activePositions = new Map(); 
-let tokenVolumeMap = new Map();  
 let processedMints = new Set();
 let globalWs = null;
 
@@ -70,7 +62,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         mint: mintAddress,
         amount: action === 'sell' ? '100%' : amountSol,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 35, // Slightly higher slippage for fast low-cap entries
+        slippage: 35,
         priorityFee: 0.003,
         pool: 'auto'
       })
@@ -93,7 +85,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
 
 // --- LIVE WEBSOCKET ENGINE ---
 function startWebSocketListener() {
-  process.stdout.write('⚡ Connecting to PumpPortal Low-Cap Buy-Power Stream...\n');
+  process.stdout.write('⚡ Connecting to PumpPortal Stream...\n');
   
   const wsUrl = PUMP_API_KEY 
     ? `wss://pumpportal.fun/api/data?api-key=${PUMP_API_KEY}` 
@@ -102,7 +94,7 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Scanning low-caps for heavy buy power...\n');
+    process.stdout.write('🟢 Connected! Subscribing to token feeds with trailing risk engine...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -112,32 +104,16 @@ function startWebSocketListener() {
       if (!event || !event.mint) return;
 
       const mintAddress = event.mint;
-
-      if (globalWs.readyState === WebSocket.OPEN) {
-        globalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mintAddress] }));
-      }
-
       const solPriceUsd = 200;
-      const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0);
-      const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
-
-      // --- TRACK LIVE BUY VS SELL VOLUME ---
-      let volStats = tokenVolumeMap.get(mintAddress) || { buyVolumeSol: 0, sellVolumeSol: 0, uniqueBuyers: new Set() };
       
-      const tradeSol = event.solAmount || (event.vSolInBondingCurve ? 0.04 : 0.02);
+      const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0.03);
+      const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves * solPriceUsd * 5);
 
-      if (event.txType === 'buy') {
-        volStats.buyVolumeSol += tradeSol;
-        if (event.traderPublicKey) volStats.uniqueBuyers.add(event.traderPublicKey);
-      } else if (event.txType === 'sell') {
-        volStats.sellVolumeSol += tradeSol;
-      }
-      tokenVolumeMap.set(mintAddress, volStats);
-
-      // 1. ACTIVE POSITION MANAGEMENT (Stop-Loss / Take-Profit)
+      // 1. ACTIVE POSITION MANAGEMENT WITH TRAILING STOP & -8% SL
       if (activePositions.has(mintAddress) && currentMc > 0) {
         const pos = activePositions.get(mintAddress);
         
+        // Update peak market cap if price goes higher
         if (currentMc > pos.highestMc) {
           pos.highestMc = currentMc;
           activePositions.set(mintAddress, pos);
@@ -146,70 +122,59 @@ function startWebSocketListener() {
         const pnlPercent = ((currentMc - pos.entryMc) / pos.entryMc) * 100;
         const dropFromPeak = ((currentMc - pos.highestMc) / pos.highestMc) * 100;
 
-        if (pnlPercent <= STOP_LOSS_PERCENT || (pnlPercent > 10 && dropFromPeak <= -10)) {
+        let exitReason = null;
+
+        // Check Hard Stop-Loss (-8%)
+        if (pnlPercent <= INITIAL_STOP_LOSS_PERCENT) {
+          exitReason = `Stop-Loss Triggered (${pnlPercent.toFixed(1)}%)`;
+        } 
+        // Check Trailing Stop (If token went up more than 10%, trail it and exit if it drops 7% from peak)
+        else if (pnlPercent > 10 && dropFromPeak <= TRAILING_DROP_PERCENT) {
+          exitReason = `Trailing Profit Lock Triggered (Peak PnL was +${((pos.highestMc - pos.entryMc) / pos.entryMc * 100).toFixed(1)}%, dropped to current)`;
+        } 
+        // Check Hard Take-Profit (+45%)
+        else if (pnlPercent >= TAKE_PROFIT_PERCENT) {
+          exitReason = `Take-Profit Target Reached (+${pnlPercent.toFixed(1)}%)`;
+        }
+
+        if (exitReason) {
           activePositions.delete(mintAddress);
-          process.stdout.write(`🔴 STOP-LOSS TRIGGERED: ${mintAddress.slice(0, 6)}... (PnL: ${pnlPercent.toFixed(1)}%)\n`);
+          process.stdout.write(`🔴 EXITTING POSITION: ${mintAddress.slice(0, 6)}... | Reason: ${exitReason}\n`);
           
           const sellTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
           if (sellTx) {
             await sendTelegramAlert(
-              `🔴 <b>Stop-Loss Executed</b>\n` +
+              `🔴 <b>Position Closed</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
-              `PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
-              `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
-            );
-          }
-        } else if (pnlPercent >= TAKE_PROFIT_PERCENT) {
-          activePositions.delete(mintAddress);
-          process.stdout.write(`🟢 TAKE-PROFIT TRIGGERED: ${mintAddress.slice(0, 6)}... (+${pnlPercent.toFixed(1)}%)\n`);
-
-          const sellTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
-          if (sellTx) {
-            await sendTelegramAlert(
-              `🟢 <b>Take-Profit Executed! 🎉</b>\n` +
-              `Mint: <code>${mintAddress}</code>\n` +
-              `PnL: <b>+${pnlPercent.toFixed(1)}%</b>\n` +
-              `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
+              `Reason: <b>${exitReason}</b>\n` +
+              `Final PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
+              `Exit MC: <b>$${currentMc.toFixed(0)}</b>\n` +
+              `<a href="https://solscan.io/tx/${sellTx}">View Tx on Solscan</a>`
             );
           }
         }
       }
 
-      // 2. LOW-CAP BUY-POWER ENTRY TRIGGER
-      if (event.txType === 'buy' && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
-        if (!processedMints.has(mintAddress)) {
-          
-          // Require active buy volume AND multiple unique buyers to confirm true green pressure
-          const hasStrongBuyPower = 
-            volStats.buyVolumeSol >= MIN_BUY_VOLUME_SOL && 
-            volStats.uniqueBuyers.size >= 2 &&
-            (volStats.sellVolumeSol === 0 || (volStats.buyVolumeSol / volStats.sellVolumeSol) >= BUY_TO_SELL_RATIO);
+      // 2. INSTANT LAUNCH ENTRY TRIGGER
+      if (!processedMints.has(mintAddress) && currentMc > 0) {
+        processedMints.add(mintAddress);
 
-          if (!hasStrongBuyPower) {
-            return; // Skip silently until buy power thresholds are met
-          }
+        process.stdout.write(`🚀 SNIPING NEW LAUNCH: ${mintAddress.slice(0, 6)}... | Initial MC: ~$${currentMc.toFixed(0)}\n`);
+        const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
-          processedMints.add(mintAddress);
+        if (buyTx) {
+          activePositions.set(mintAddress, {
+            entryMc: currentMc,
+            highestMc: currentMc,
+            buyTime: Date.now()
+          });
 
-          process.stdout.write(`🚀 LOW-CAP BUY-POWER MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)} | Buy Vol: ${volStats.buyVolumeSol.toFixed(2)} SOL | Buyers: ${volStats.uniqueBuyers.size}\n`);
-          const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
-
-          if (buyTx) {
-            activePositions.set(mintAddress, {
-              entryMc: currentMc,
-              highestMc: currentMc,
-              buyTime: Date.now()
-            });
-
-            await sendTelegramAlert(
-              `🚀 <b>Low-Cap Buy-Power Entry!</b>\n` +
-              `Mint: <code>${mintAddress}</code>\n` +
-              `MC: <b>$${currentMc.toFixed(0)}</b>\n` +
-              `Buy Vol: <b>${volStats.buyVolumeSol.toFixed(2)} SOL</b>\n` +
-              `Unique Buyers: <b>${volStats.uniqueBuyers.size}</b>\n` +
-              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-            );
-          }
+          await sendTelegramAlert(
+            `🚀 <b>New Token Snipe Entry!</b>\n` +
+            `Mint: <code>${mintAddress}</code>\n` +
+            `Entry MC: <b>~$${currentMc.toFixed(0)}</b>\n` +
+            `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+          );
         }
       }
     } catch (err) {
@@ -226,7 +191,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('⚡ <b>Pump.fun Low-Cap Buy-Power Bot Online ($10K-$60K)</b>');
+  await sendTelegramAlert('⚡ <b>Pump.fun Trailing Stop Bot Online (-8% SL / Trailing Profit)</b>');
   startWebSocketListener();
 }
 
