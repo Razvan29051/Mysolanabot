@@ -1,4 +1,4 @@
-import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 
 // --- CONFIGURATION & ENV VARS ---
@@ -56,16 +56,15 @@ async function executePumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
     console.log(`🔄 Requesting Pump.fun ${action} transaction for ${mintAddress} (${amountSol} SOL)...`);
 
-    // Request raw transaction payload from PumpPortal trade API
     const response = await fetch(`https://pumpportal.fun/api/trade`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action: action, // 'buy' or 'sell'
+        action: action,
         mint: mintAddress,
         amount: amountSol,
         denominatedInSol: 'true',
-        slippage: 15, // 15% slippage protection for volatile early tokens
+        slippage: 15,
         priorityFee: 0.0005,
         pool: 'pump'
       })
@@ -81,7 +80,6 @@ async function executePumpSwap(mintAddress, amountSol, action = 'buy') {
       throw new Error('No transaction data returned from PumpPortal');
     }
 
-    // Deserialize, sign, and broadcast transaction via your direct RPC
     const txBuf = Buffer.from(data.tx, 'base64');
     const transaction = VersionedTransaction.deserialize(txBuf);
     transaction.sign([wallet]);
@@ -184,7 +182,6 @@ async function startRpcScanner() {
             const accountInfo = await connection.getAccountInfo(new PublicKey(mintAddress));
             if (accountInfo && accountInfo.data.length > 0) {
               
-              // Estimated market cap within your sweet spot for active testing
               const marketCapUsd = 15000; 
 
               console.log(`👀 Evaluated Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}`);
