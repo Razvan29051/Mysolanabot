@@ -51,7 +51,7 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Corrected String Parameters) ---
+// --- LOCAL TRANSACTION PUMP.FUN EXECUTION ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
     console.log(`🔄 Requesting local trade for ${mintAddress} (${amountSol} SOL, action: ${action})...`);
@@ -64,7 +64,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         action: action,
         mint: mintAddress,
         amount: amountSol,
-        denominatedInSol: "true", // Must be a string per PumpPortal specs
+        denominatedInSol: "true", // MUST be a string per PumpPortal specs
         slippage: 15,
         priorityFee: 0.0005,
         pool: 'auto'
@@ -224,7 +224,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Local Transaction Mode ($3K-$35K). Parameter fix applied.`
+    `Status: Local Transaction Mode ($3K-$35K). DenominatedInSol string fixed.`
   );
   startRpcScanner();
 }
