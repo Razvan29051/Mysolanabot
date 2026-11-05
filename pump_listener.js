@@ -21,12 +21,11 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// --- OPTIMIZED STRATEGY TARGETS ($4K - $35K MC Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 4000;  // Filters out raw launch chaos below $4K
-const MAX_MARKET_CAP_USD = 35000; // Captures early growth before graduation wall
+// --- STRATEGY TARGETS ($4K - $35K MC Sweet Spot) ---
+const MIN_MARKET_CAP_USD = 4000;
+const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
-let lastCheckTime = 0;
 let reconnectAttempts = 0;
 
 // --- TELEGRAM NOTIFICATION HELPER ---
@@ -96,7 +95,7 @@ async function evaluateTokenSetup(mintAddress) {
     const solPriceUsd = 200;
     const marketCapUsd = coinData.usd_market_cap || ((coinData.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
 
-    console.log(`🔍 Checking token ${mintAddress.slice(0, 6)}... MC: $${marketCapUsd.toFixed(0)}`);
+    console.log(`🔍 Evaluated Token: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
 
     if (marketCapUsd < MIN_MARKET_CAP_USD || marketCapUsd > MAX_MARKET_CAP_USD) {
       return false;
@@ -163,7 +162,7 @@ function startWebSocket() {
   const ws = new WebSocket(WSS_ENDPOINT);
 
   ws.on('open', () => {
-    console.log('⚡ Connected to Solana WSS Stream - Scanning Momentum Setups');
+    console.log('⚡ Connected to Solana WSS Stream - Live Diagnostic Mode');
     reconnectAttempts = 0;
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
@@ -178,15 +177,11 @@ function startWebSocket() {
 
   ws.on('message', async (data) => {
     try {
-      const now = Date.now();
-      if (now - lastCheckTime < 1000) return; // Responsive 1s throttle
-      lastCheckTime = now;
-
       const response = JSON.parse(data);
       if (!response.params?.result?.value) return;
 
-      const logs = response.params.result.value.logs || [];
       const signature = response.params.result.value.signature;
+      console.log(`⚡ Raw Tx Detected: ${signature}`);
 
       const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
       if (!txInfo || !txInfo.transaction) return;
@@ -221,7 +216,9 @@ function startWebSocket() {
           activePositions.delete(mintAddress);
         }
       }
-    } catch (err) {}
+    } catch (err) {
+      console.error('Error processing message:', err.message);
+    }
   });
 
   ws.on('error', (err) => {
@@ -242,7 +239,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Active scan mode ($4K-$35K Market Cap range).`
+    `Status: Diagnostic Mode Active.`
   );
   startWebSocket();
 }
