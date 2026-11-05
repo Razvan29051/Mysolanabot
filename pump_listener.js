@@ -141,50 +141,35 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
 async function startRpcScanner() {
   console.log('⚡ Direct RPC Scanner Active - Polling Pump.fun Program via RPC...');
   runRpcScanCycle();
-  setInterval(runRpcScanCycle, 5000); // Polls every 5 seconds securely via RPC
+  setInterval(runRpcScanCycle, 5000);
 }
 
 async function runRpcScanCycle() {
   try {
-    console.log('🔍 Fetching recent signatures from Pump.fun program via RPC...');
-    
-    // Fetch recent transaction signatures directly from your RPC provider for the pump.fun program
     const signatures = await connection.getSignaturesForAddress(PUMP_FUN_PROGRAM_ID, { limit: 15 }, 'confirmed');
     
-    if (!signatures || signatures.length === 0) {
-      console.log('⚠️ No recent signatures found.');
-      return;
-    }
-
-    console.log(`⚡ Retrieved ${signatures.length} recent signatures. Checking transactions...`);
+    if (!signatures || signatures.length === 0) return;
 
     for (const sigInfo of signatures) {
       const signature = sigInfo.signature;
       if (processedMints.has(signature)) continue;
       processedMints.add(signature);
 
-      // Fetch transaction details via RPC
+      // FIXED: Added maxSupportedTransactionVersion: 0 to support v0 transactions
       const tx = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
       if (!tx || !tx.transaction) continue;
 
-      // Extract newly created token mint accounts from transaction instructions/accounts
       const accountKeys = tx.transaction.message.accountKeys;
       for (const account of accountKeys) {
         const mintAddress = account.pubkey.toString();
         
         if (activePositions.has(mintAddress)) continue;
 
-        // Quick verification check using a lightweight public mint metadata or backup validation
-        // (Or evaluate via bonding curve account info)
         try {
           const accountInfo = await connection.getAccountInfo(new PublicKey(mintAddress));
           if (!accountInfo) continue;
 
-          // Simple heuristic market cap check via virtual reserves or token supply state
-          // For safety, let's verify if it's an active token
           console.log(`💎 Found active token account: ${mintAddress}`);
-          
-          // Trigger buy validation here...
           break;
         } catch (e) {
           // Ignore invalid mint accounts
