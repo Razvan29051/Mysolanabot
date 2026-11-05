@@ -23,7 +23,7 @@ const MIN_MARKET_CAP_USD = 4000;
 const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
-let processedMints = new Set(); // Prevents evaluating the same token twice
+let processedMints = new Set();
 
 // --- TELEGRAM NOTIFICATION HELPER ---
 async function sendTelegramAlert(message) {
@@ -131,15 +131,17 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- API SCANNER LOOP (ZERO RPC 429 ERRORS) ---
+// --- API SCANNER LOOP WITH STATUS LOGS ---
 async function startScanner() {
-  console.log('⚡ Pump.fun API Scanner Active - Zero Rate-Limit Mode');
+  console.log('⚡ Pump.fun API Scanner Active - Scanning $4K-$35K Range...');
   
   setInterval(async () => {
     try {
-      const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=DESC');
+      const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC');
       if (!res.ok) return;
       const coins = await res.json();
+
+      console.log(`🔍 Checked ${coins.length} recent launches. Scanning for $4K-$35K sweet spot...`);
 
       for (const coin of coins) {
         const mintAddress = coin.mint;
@@ -173,13 +175,13 @@ async function startScanner() {
             activePositions.delete(mintAddress);
           }
           
-          break; // Process one per cycle to maintain smooth execution
+          break; 
         }
       }
     } catch (err) {
-      // Suppress network noise
+      console.error('Scanner error:', err.message);
     }
-  }, 3000); // Scans safely every 3 seconds
+  }, 4000); // Scans every 4 seconds cleanly
 }
 
 // --- BOT INITIALIZATION ---
@@ -188,7 +190,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: API Scanner Mode ($4K-$35K Market Cap range).`
+    `Status: Active Scan Mode ($4K-$35K).`
   );
   startScanner();
 }
