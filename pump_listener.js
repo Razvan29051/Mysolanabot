@@ -22,7 +22,7 @@ const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5u
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
 // --- OPTIMIZED STRATEGY TARGETS ($8K - $35K MC Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 8000;
+const MIN_MARKET_CAP_USD = 4000;
 const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
