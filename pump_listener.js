@@ -113,7 +113,7 @@ async function hasStrongBuyPressure(tokenMint) {
     }
 
     const lastTradesBuyHeavy = buyCount >= sellCount + 1;
-    const volumeBuyHeavy = buyVolume > sellVolume * 1.3;
+    const volumeBuyHeavy = buyVolume > sellVolume * 1.15; // relaxed for ~70% win rate
 
     const strong = lastTradesBuyHeavy && volumeBuyHeavy;
 
@@ -236,8 +236,8 @@ async function handleGraduationCandidate(signature) {
 
     console.log(`🔍 [Curve Check] Progress: ${graduationProgress.toFixed(1)}% | Virtual SOL: ${(virtualSol / 1e9).toFixed(1)}`);
 
-    // Strict entry filters
-    if (graduationProgress < 93 || virtualSol < 70_000_000_000) {
+    // Balanced filters for ~70% win rate
+    if (graduationProgress < 87 || virtualSol < 55_000_000_000) {
       isTrading = false;
       return;
     }
