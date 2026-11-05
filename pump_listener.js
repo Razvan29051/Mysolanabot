@@ -106,7 +106,6 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
   const dropFromPeak = ((position.peakMc - currentMc) / position.peakMc) * 100;
   const ageMs = Date.now() - position.entryTime;
 
-  // TAKE PROFIT: Hit +22% gain -> Lock in profits
   if (pnlPercentage >= 22 && !position.tookPartialProfit) {
     position.tookPartialProfit = true;
     const sellAmount = Number((TRADE_AMOUNT_SOL * 0.6).toFixed(4));
@@ -121,7 +120,6 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
     );
   }
 
-  // STOP LOSS / TRAILING EXIT
   const hitStopLoss = pnlPercentage <= -10;
   const hitTrailingDrop = position.tookPartialProfit && dropFromPeak >= 10;
   const hitTimeout = ageMs > 240000;
@@ -148,7 +146,6 @@ function startWebSocketListener() {
 
   globalWs.on('open', () => {
     console.log('🟢 Connected. Listening for active token creations and wave movements...');
-    // Subscribe to new token events to capture mints and watch them as they grow
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -159,25 +156,21 @@ function startWebSocketListener() {
 
       const mintAddress = event.mint;
 
-      // 1. Evaluate positions if already held
       if (activePositions.has(mintAddress)) {
         const currentMc = event.usd_market_cap || (event.marketCapSol * 200) || 0;
         if (currentMc > 0) await evaluatePositionRealtime(mintAddress, currentMc);
         return;
       }
 
-      // 2. Track token creation & incoming buy volume
       const solPriceUsd = 200;
       const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
 
-      // Dynamically subscribe to individual token trades as soon as they reach our target zone ($4K+)
       if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
         let stats = tokenMetrics.get(mintAddress);
         if (!stats) {
           stats = { buyCount: 0, volumeSol: 0 };
           tokenMetrics.set(mintAddress, stats);
 
-          // Subscribe specifically to live trade updates for this active token
           globalWs.send(JSON.stringify({
             method: 'subscribeTokenTrade',
             keys: [mintAddress]
@@ -189,7 +182,6 @@ function startWebSocketListener() {
 
         console.log(`👀 Watching Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL`);
 
-        // MOMENTUM TRIGGER: 3+ buys & 1.0+ SOL accumulated volume in target zone
         if (stats.buyCount >= 3 && stats.volumeSol >= 1.0 && !processedMints.has(mintAddress)) {
           processedMints.add(mintAddress);
           tokenMetrics.delete(mintAddress);
