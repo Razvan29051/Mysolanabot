@@ -1,11 +1,9 @@
 import { Connection, Keypair, VersionedTransaction } from '@solana/web3.js';
-import WebSocket from 'ws';
 import bs58 from 'bs58';
 
 // --- CONFIGURATION & ENV VARS ---
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || process.env.RPC_URL;
 const RAW_PRIVATE_KEY = process.env.PRIVATE_KEY || process.env.BOT_PRIVATE_KEY;
-const PUMP_API_KEY = process.env.PUMP_PORTAL_API_KEY;
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -20,20 +18,18 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- TARGET WINDOW & BUY POWER THRESHOLDS ---
+// --- TARGET WINDOW & LIQUIDITY FILTERS ---
 const MIN_MARKET_CAP_USD = 15000;  
-const MAX_MARKET_CAP_USD = 90000;  
-const MIN_BUY_VELOCITY = 3;        // Requires at least 3 consecutive/net buys to prove green candle momentum
+const MAX_MARKET_CAP_USD = 100000; 
+const MIN_2H_VOLUME_USD = 1000;    // Ensures coin has active volume and isn't a dead $41 shitcoin
 
 // --- RISK MANAGEMENT ---
-const STOP_LOSS_PERCENT = -8.0;     // Tight -8% stop loss
+const STOP_LOSS_PERCENT = -8.0;     
 const TRAILING_DROP_PERCENT = -7.0;    
 const TAKE_PROFIT_PERCENT = 45.0;      
 
 let activePositions = new Map(); 
-let tokenMomentumMap = new Map();  // Tracks active buy vs sell velocity per token
 let processedMints = new Set();
-let globalWs = null;
 
 // --- TELEGRAM NOTIFIER ---
 async function sendTelegramAlert(message) {
@@ -89,61 +85,41 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   }
 }
 
-// --- LIVE WEBSOCKET ENGINE ---
-function startWebSocketListener() {
-  process.stdout.write('⚡ Connecting to PumpPortal Live Momentum Stream...\n');
-  
-  const wsUrl = PUMP_API_KEY 
-    ? `wss://pumpportal.fun/api/data?api-key=${PUMP_API_KEY}` 
-    : `wss://pumpportal.fun/api/data`;
+// --- ACTIVE MARKET SCANNER LOOP ---
+async function scanAndTradeMarkets() {
+  try {
+    process.stdout.write('🔍 Scanning active Pump.fun markets for momentum...\n');
+    
+    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump', {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
 
-  globalWs = new WebSocket(wsUrl);
+    if (!res.ok) throw new Error(`DexScreener status ${res.status}`);
+    const data = await res.json();
+    if (!data.pairs) return;
 
-  globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Subscribing to token trade feeds...\n');
-    globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
-  });
-
-  globalWs.on('message', async (data) => {
-    try {
-      const event = JSON.parse(data.toString());
-      if (!event || !event.mint) return;
-
-      const mintAddress = event.mint;
-      const solPriceUsd = 200;
+    for (const pair of data.pairs) {
+      if (pair.chainId !== 'solana') continue;
       
-      const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0.03);
-      const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves * solPriceUsd * 5);
+      const mintAddress = pair.baseToken?.address;
+      const marketCap = pair.marketCap || 0;
+      const volume2h = pair.volume?.h2 || pair.volume?.h1 || 0;
 
-      // Dynamically subscribe to live trades for every discovered token
-      if (globalWs.readyState === WebSocket.OPEN) {
-        globalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mintAddress] }));
-      }
+      if (!mintAddress) continue;
 
-      // --- TRACK BUY / SELL MOMENTUM ---
-      let momentum = tokenMomentumMap.get(mintAddress) || { buys: 0, sells: 0, buySol: 0 };
-      if (event.txType === 'buy') {
-        momentum.buys += 1;
-        momentum.buySol += (event.solAmount || 0.05);
-      } else if (event.txType === 'sell') {
-        momentum.sells += 1;
-      }
-      tokenMomentumMap.set(mintAddress, momentum);
-
-      // 1. ACTIVE POSITION MANAGEMENT (Stop-Loss / Take-Profit)
-      if (activePositions.has(mintAddress) && currentMc > 0) {
+      // 1. POSITION MANAGEMENT (Stop-Loss / Take-Profit)
+      if (activePositions.has(mintAddress) && marketCap > 0) {
         const pos = activePositions.get(mintAddress);
         
-        if (currentMc > pos.highestMc) {
-          pos.highestMc = currentMc;
+        if (marketCap > pos.highestMc) {
+          pos.highestMc = marketCap;
           activePositions.set(mintAddress, pos);
         }
 
-        const pnlPercent = ((currentMc - pos.entryMc) / pos.entryMc) * 100;
-        const dropFromPeak = ((currentMc - pos.highestMc) / pos.highestMc) * 100;
+        const pnlPercent = ((marketCap - pos.entryMc) / pos.entryMc) * 100;
+        const dropFromPeak = ((marketCap - pos.highestMc) / pos.highestMc) * 100;
 
         let exitReason = null;
-
         if (pnlPercent <= STOP_LOSS_PERCENT) {
           exitReason = `Stop-Loss Triggered (${pnlPercent.toFixed(1)}%)`;
         } else if (pnlPercent > 10 && dropFromPeak <= TRAILING_DROP_PERCENT) {
@@ -163,58 +139,51 @@ function startWebSocketListener() {
               `Mint: <code>${mintAddress}</code>\n` +
               `Reason: <b>${exitReason}</b>\n` +
               `Final PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
-              `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
+              `Exit MC: <b>$${marketCap.toFixed(0)}</b>`
             );
           }
         }
-        return;
+        continue;
       }
 
-      // 2. GREEN CANDLE BUY-POWER ENTRY TRIGGER
-      if (!processedMints.has(mintAddress) && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
-        
-        // Strict Green Candle Check: Must have active net buys and outpace sells
-        const isStrongGreenCandle = momentum.buys >= MIN_BUY_VELOCITY && momentum.buys > momentum.sells;
-
-        if (isStrongGreenCandle) {
+      // 2. ENTRY FILTER MATCH (Target MC + Real Active Volume)
+      if (!processedMints.has(mintAddress)) {
+        if (marketCap >= MIN_MARKET_CAP_USD && marketCap <= MAX_MARKET_CAP_USD && volume2h >= MIN_2H_VOLUME_USD) {
           processedMints.add(mintAddress);
 
-          process.stdout.write(`🚀 GREEN CANDLE MOMENTUM MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)} | Buys: ${momentum.buys}\n`);
+          process.stdout.write(`🚀 MOMENTUM MATCH: ${mintAddress.slice(0, 6)}... | MC: $${marketCap.toFixed(0)} | Volume: $${volume2h}\n`);
           const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
           if (buyTx) {
             activePositions.set(mintAddress, {
-              entryMc: currentMc,
-              highestMc: currentMc,
+              entryMc: marketCap,
+              highestMc: marketCap,
               buyTime: Date.now()
             });
 
             await sendTelegramAlert(
-              `🚀 <b>Green Candle Buy-Power Entry!</b>\n` +
+              `🚀 <b>Momentum Snipe Entry!</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
-              `Entry MC: <b>~$${currentMc.toFixed(0)}</b>\n` +
-              `Confirmed Buys: <b>${momentum.buys}</b>\n` +
+              `Entry MC: <b>~$${marketCap.toFixed(0)}</b>\n` +
+              `Volume: <b>$${volume2h}</b>\n` +
               `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
             );
           }
         }
       }
-    } catch (err) {
-      process.stdout.write(`❌ Parse error: ${err.message}\n`);
     }
-  });
-
-  globalWs.on('error', (err) => process.stdout.write(`❌ WS Error: ${err.message}\n`));
-  globalWs.on('close', () => {
-    process.stdout.write('⚠️ Disconnected. Reconnecting in 5s...\n');
-    setTimeout(startWebSocketListener, 5000);
-  });
+  } catch (err) {
+    process.stdout.write(`⚠️ Scanner warning: ${err.message}\n`);
+  }
 }
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('⚡ <b>Pump.fun Green-Candle Buy-Power Bot Online</b>');
-  startWebSocketListener();
+  await sendTelegramAlert('⚡ <b>Pump.fun Active Momentum Scanner Online</b>');
+  
+  // Run scanner every 7 seconds
+  setInterval(scanAndTradeMarkets, 7000);
+  scanAndTradeMarkets();
 }
 
 main();
