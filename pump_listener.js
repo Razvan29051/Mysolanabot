@@ -1,10 +1,8 @@
 import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
-import WebSocket from 'ws';
 import bs58 from 'bs58';
 
 // --- CONFIGURATION & ENV VARS ---
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || process.env.RPC_URL;
-const WSS_ENDPOINT = process.env.WSS_ENDPOINT || process.env.WS_URL;
 const RAW_PRIVATE_KEY = process.env.PRIVATE_KEY || process.env.BOT_PRIVATE_KEY;
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -18,7 +16,6 @@ if (!RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
 // --- STRATEGY TARGETS ($4K - $35K MC Sweet Spot) ---
@@ -26,7 +23,7 @@ const MIN_MARKET_CAP_USD = 4000;
 const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
-let reconnectAttempts = 0;
+let processedMints = new Set(); // Prevents evaluating the same token twice
 
 // --- TELEGRAM NOTIFICATION HELPER ---
 async function sendTelegramAlert(message) {
@@ -85,29 +82,6 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
   }
 }
 
-// --- EVALUATE MARKET CAP MOMENTUM ---
-async function evaluateTokenSetup(mintAddress) {
-  try {
-    const res = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
-    if (!res.ok) return false;
-    const coinData = await res.json();
-
-    const solPriceUsd = 200;
-    const marketCapUsd = coinData.usd_market_cap || ((coinData.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
-
-    console.log(`🔍 Evaluated Token: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
-
-    if (marketCapUsd < MIN_MARKET_CAP_USD || marketCapUsd > MAX_MARKET_CAP_USD) {
-      return false;
-    }
-
-    console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
-    return true;
-  } catch (error) {
-    return false;
-  }
-}
-
 // --- POSITION MONITORING & RISK MANAGEMENT ---
 async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   const entryTime = Date.now();
@@ -157,80 +131,55 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- MAIN WEBSOCKET LISTENER ---
-function startWebSocket() {
-  const ws = new WebSocket(WSS_ENDPOINT);
-
-  ws.on('open', () => {
-    console.log('⚡ Connected to Solana WSS Stream - Live Diagnostic Mode');
-    reconnectAttempts = 0;
-    ws.send(JSON.stringify({
-      jsonrpc: '2.0',
-      id: 1,
-      method: 'logsSubscribe',
-      params: [
-        { mentions: [PUMP_FUN_PROGRAM_ID.toString()] },
-        { commitment: 'confirmed' }
-      ]
-    }));
-  });
-
-  ws.on('message', async (data) => {
+// --- API SCANNER LOOP (ZERO RPC 429 ERRORS) ---
+async function startScanner() {
+  console.log('⚡ Pump.fun API Scanner Active - Zero Rate-Limit Mode');
+  
+  setInterval(async () => {
     try {
-      const response = JSON.parse(data);
-      if (!response.params?.result?.value) return;
+      const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=30&sort=created_timestamp&order=DESC');
+      if (!res.ok) return;
+      const coins = await res.json();
 
-      const signature = response.params.result.value.signature;
-      console.log(`⚡ Raw Tx Detected: ${signature}`);
+      for (const coin of coins) {
+        const mintAddress = coin.mint;
+        if (!mintAddress || processedMints.has(mintAddress) || activePositions.has(mintAddress)) continue;
 
-      const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
-      if (!txInfo || !txInfo.transaction) return;
+        const solPriceUsd = 200;
+        const marketCapUsd = coin.usd_market_cap || ((coin.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
 
-      const accountKeys = txInfo.transaction.message.accountKeys;
-      const mintAccount = accountKeys.find(a => a.writable && !a.signer);
-      const mintAddress = mintAccount?.pubkey?.toString();
+        if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
+          processedMints.add(mintAddress);
+          console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
 
-      if (!mintAddress || activePositions.has(mintAddress)) return;
-
-      const isQualified = await evaluateTokenSetup(mintAddress);
-
-      if (isQualified) {
-        activePositions.set(mintAddress, true);
-
-        await sendTelegramAlert(
-          `🎯 <b>Momentum Target Found ($4K-$35K MC)!</b>\n` +
-          `Mint: <code>${mintAddress}</code>\n` +
-          `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
-        );
-
-        const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
-
-        if (buyTx) {
           await sendTelegramAlert(
-            `✅ <b>Position Entered</b>\n` +
+            `🎯 <b>Momentum Target Found ($4K-$35K MC)!</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
-            `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+            `Market Cap: $${marketCapUsd.toFixed(0)}\n` +
+            `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
           );
-          monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
-        } else {
-          activePositions.delete(mintAddress);
+
+          activePositions.set(mintAddress, true);
+          const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
+
+          if (buyTx) {
+            await sendTelegramAlert(
+              `✅ <b>Position Entered</b>\n` +
+              `Mint: <code>${mintAddress}</code>\n` +
+              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+            );
+            monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
+          } else {
+            activePositions.delete(mintAddress);
+          }
+          
+          break; // Process one per cycle to maintain smooth execution
         }
       }
     } catch (err) {
-      console.error('Error processing message:', err.message);
+      // Suppress network noise
     }
-  });
-
-  ws.on('error', (err) => {
-    console.error('WSS Error:', err.message);
-  });
-
-  ws.on('close', () => {
-    reconnectAttempts++;
-    const delay = Math.min(reconnectAttempts * 3000, 20000);
-    console.log(`⚠️ WebSocket disconnected. Reconnecting in ${delay / 1000} seconds...`);
-    setTimeout(startWebSocket, delay);
-  });
+  }, 3000); // Scans safely every 3 seconds
 }
 
 // --- BOT INITIALIZATION ---
@@ -239,9 +188,9 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Diagnostic Mode Active.`
+    `Status: API Scanner Mode ($4K-$35K Market Cap range).`
   );
-  startWebSocket();
+  startScanner();
 }
 
 main();
