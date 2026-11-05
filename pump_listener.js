@@ -30,20 +30,31 @@ let processedMints = new Set();
 let trackedMints = new Set();
 let globalWs = null;
 
+// --- TELEGRAM NOTIFIER WITH ERROR DEBUGGING ---
 async function sendTelegramAlert(message) {
-  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+    process.stdout.write('⚠️ Telegram Alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.\n');
+    return;
+  }
   const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
   try {
-    await fetch(url, {
+    const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message, parse_mode: 'HTML' })
     });
+    const data = await res.json();
+    if (!data.ok) {
+      process.stdout.write(`❌ Telegram API Error: ${data.description}\n`);
+    } else {
+      process.stdout.write(`📩 Telegram alert delivered!\n`);
+    }
   } catch (err) {
-    process.stdout.write(`Telegram error: ${err.message}\n`);
+    process.stdout.write(`❌ Telegram network error: ${err.message}\n`);
   }
 }
 
+// --- LOCAL SWAP EXECUTION ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
     process.stdout.write(`🔄 Requesting ${action} for ${mintAddress} (${amountSol} SOL)...\n`);
@@ -59,7 +70,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         denominatedInSol: "true",
         slippage: 25,
         priorityFee: 0.0015,
-        pool: 'pump'
+        pool: 'auto'
       })
     });
 
@@ -78,7 +89,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   }
 }
 
-// Dynamically subscribe to trade events for a batch of token mints
+// --- DYNAMIC MINT SUBSCRIBER ---
 function subscribeToMints(mintArray) {
   if (!globalWs || globalWs.readyState !== WebSocket.OPEN) return;
   
@@ -92,9 +103,32 @@ function subscribeToMints(mintArray) {
     keys: newMints
   }));
   
-  process.stdout.write(`📡 Subscribed to live trades for ${newMints.length} tokens.\n`);
+  process.stdout.write(`📡 Subscribed to live trades for ${newMints.length} active tokens.\n`);
 }
 
+// --- FETCH TOP RISING PUMP.FUN TOKENS FROM DEXSCREENER ---
+async function fetchTopActiveMints() {
+  try {
+    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump');
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data.pairs) return;
+
+    // Filter for Solana pump.fun pairs in our target market cap range
+    const activeMints = data.pairs
+      .filter(p => p.chainId === 'solana' && p.marketCap >= MIN_MARKET_CAP_USD && p.marketCap <= MAX_MARKET_CAP_USD)
+      .map(p => p.baseToken.address);
+
+    if (activeMints.length > 0) {
+      process.stdout.write(`🔎 DexScreener found ${activeMints.length} active tokens in $4K-$50K target range.\n`);
+      subscribeToMints(activeMints);
+    }
+  } catch (err) {
+    process.stdout.write(`⚠️ DexScreener fetch warning: ${err.message}\n`);
+  }
+}
+
+// --- WEBSOCKET ENGINE ---
 function startWebSocketListener() {
   process.stdout.write('⚡ Connecting to PumpPortal Stream Engine...\n');
   
@@ -105,8 +139,12 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Listening to token creations and trade feeds...\n');
+    process.stdout.write('🟢 Connected! Subscribing to token creations...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
+
+    // Poll DexScreener every 15 seconds to catch established rising coins
+    fetchTopActiveMints();
+    setInterval(fetchTopActiveMints, 15000);
   });
 
   globalWs.on('message', async (data) => {
@@ -116,7 +154,7 @@ function startWebSocketListener() {
 
       const mintAddress = event.mint;
 
-      // Automatically register new launches to trade stream
+      // Subscribe to trades on brand new launches immediately
       if (event.txType === 'create' || !event.txType) {
         subscribeToMints([mintAddress]);
       }
@@ -130,16 +168,14 @@ function startWebSocketListener() {
         process.stdout.write(`📥 Live Trade -> Mint: ${mintAddress.slice(0, 6)}... | Type: ${event.txType} | MC: $${marketCapUsd.toFixed(0)}\n`);
       }
 
-      // Trigger condition: Real BUY trade in target range ($4K - $50K)
+      // Trigger condition: BUY trade inside target range ($4K - $50K)
       if (event.txType === 'buy' && marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
-        let stats = tokenMetrics.get(mintAddress) || { buyCount: 0, volumeSol: 0 };
+        let stats = tokenMetrics.get(mintAddress) || { buyCount: 0 };
         stats.buyCount += 1;
-        stats.volumeSol += Number(event.solAmount || 0.1);
         tokenMetrics.set(mintAddress, stats);
 
-        process.stdout.write(`🎯 SWEET SPOT BUY MATCH: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount}\n`);
+        process.stdout.write(`🎯 TARGET RANGE MATCH: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount}\n`);
 
-        // Buy immediately on momentum signal
         if (!processedMints.has(mintAddress)) {
           processedMints.add(mintAddress);
           tokenMetrics.delete(mintAddress);
@@ -149,7 +185,7 @@ function startWebSocketListener() {
 
           if (buyTx) {
             await sendTelegramAlert(
-              `🌊 <b>Momentum Wave Buy</b>\n` +
+              `🌊 <b>Momentum Wave Buy Executed!</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
               `MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
               `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
@@ -171,7 +207,8 @@ function startWebSocketListener() {
 }
 
 async function main() {
-  process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
+  process.stdout.write(`🔑 Bot Wallet Active: ${wallet.publicKey.toString()}\n`);
+  await sendTelegramAlert('🚀 <b>Pump.fun Trading Bot Online</b>');
   startWebSocketListener();
 }
 
