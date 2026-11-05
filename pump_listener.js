@@ -20,14 +20,14 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- STRICT HIGH-VOLUME MOMENTUM TARGETS ---
-const MIN_MARKET_CAP_USD = 50000;  // Floor: No low caps
-const MAX_MARKET_CAP_USD = 120000; // Ceiling: Graduation approach
-const MIN_HOURLY_VOLUME_USD = 25000; // Raised to $25K to ensure intense green candles
+// --- OPTIMIZED TARGETS ($50K - $120K MC, $10K+ Hourly Volume) ---
+const MIN_MARKET_CAP_USD = 50000;  
+const MAX_MARKET_CAP_USD = 120000; 
+const MIN_HOURLY_VOLUME_USD = 10000; // Adjusted to $10K for balanced filtering
 
 // --- RISK MANAGEMENT ---
-const STOP_LOSS_PERCENT = -10;     // Sell if down 10%
-const TAKE_PROFIT_PERCENT = 45;    // Lock in profits at +45%
+const STOP_LOSS_PERCENT = -10;     
+const TAKE_PROFIT_PERCENT = 45;    
 
 let activePositions = new Map(); 
 let tokenTxCounts = new Map();   
@@ -104,15 +104,17 @@ function subscribeToMints(mintArray) {
   }));
 }
 
-// --- FETCH HEAVY VOLUME TOKENS FROM DEXSCREENER ---
+// --- FETCH TOKENS FROM DEXSCREENER ---
 async function fetchTopActiveMints() {
   try {
-    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump');
+    const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump', {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+    });
+    
     if (!res.ok) return;
     const data = await res.json();
     if (!data.pairs) return;
 
-    // Filter tokens by strict $25K+ hourly volume and graduation market cap range
     const activePairs = data.pairs.filter(p => 
       p.chainId === 'solana' && 
       p.marketCap >= MIN_MARKET_CAP_USD && 
@@ -128,7 +130,7 @@ async function fetchTopActiveMints() {
       if (!processedMints.has(mintAddress)) {
         processedMints.add(mintAddress);
 
-        process.stdout.write(`💎 HEAVY VOLUME GEM: ${mintAddress} | MC: $${pair.marketCap.toFixed(0)} | 1h Vol: $${pair.volume.h1}\n`);
+        process.stdout.write(`💎 ACTIVE VOLUME GEM: ${mintAddress} | MC: $${pair.marketCap.toFixed(0)} | 1h Vol: $${pair.volume.h1}\n`);
         const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
         if (buyTx) {
@@ -139,7 +141,7 @@ async function fetchTopActiveMints() {
           });
 
           await sendTelegramAlert(
-            `💎 <b>Heavy Volume Entry!</b>\n` +
+            `💎 <b>Active Volume Entry!</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
             `MC: <b>$${pair.marketCap.toFixed(0)}</b>\n` +
             `1h Volume: <b>$${pair.volume.h1}</b>\n` +
@@ -156,7 +158,7 @@ async function fetchTopActiveMints() {
   }
 }
 
-// --- WEBSOCKET ENGINE & LIVE VOLUME RATIO MONITORING ---
+// --- WEBSOCKET ENGINE & LIVE MONITORING ---
 function startWebSocketListener() {
   process.stdout.write('⚡ Connecting to PumpPortal Stream Engine...\n');
   
@@ -167,7 +169,7 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Tracking high-volume green candles...\n');
+    process.stdout.write('🟢 Connected! Tracking volume streams...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
     fetchTopActiveMints();
@@ -189,13 +191,12 @@ function startWebSocketListener() {
       const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0);
       const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
 
-      // Track transaction pressure
       let txStats = tokenTxCounts.get(mintAddress) || { buys: 0, sells: 0 };
       if (event.txType === 'buy') txStats.buys += 1;
       if (event.txType === 'sell') txStats.sells += 1;
       tokenTxCounts.set(mintAddress, txStats);
 
-      // ACTIVE POSITION STOP-LOSS / TAKE-PROFIT CHECK
+      // ACTIVE POSITION CHECK
       if (activePositions.has(mintAddress) && currentMc > 0) {
         const pos = activePositions.get(mintAddress);
         
@@ -236,18 +237,18 @@ function startWebSocketListener() {
         }
       }
 
-      // LIVE STREAM BUY TRIGGER (Requires dominant buy pressure)
+      // LIVE STREAM BUY TRIGGER
       if (event.txType === 'buy' && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
         if (!processedMints.has(mintAddress)) {
           
           if (txStats.buys < txStats.sells) {
-            process.stdout.write(`🛡️ SKIPPING WEAK FLOW: ${mintAddress.slice(0, 6)}... (Sells outweighing buys).\n`);
+            process.stdout.write(`🛡️ SKIPPING WEAK FLOW: ${mintAddress.slice(0, 6)}...\n`);
             return;
           }
 
           processedMints.add(mintAddress);
 
-          process.stdout.write(`🚀 HEAVY VOLUME STREAM MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)} | Buys: ${txStats.buys}\n`);
+          process.stdout.write(`🚀 STREAM MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)} | Buys: ${txStats.buys}\n`);
           const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
           if (buyTx) {
@@ -258,7 +259,7 @@ function startWebSocketListener() {
             });
 
             await sendTelegramAlert(
-              `🚀 <b>Heavy Volume Stream Entry!</b>\n` +
+              `🚀 <b>Stream Entry!</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
               `MC: <b>$${currentMc.toFixed(0)}</b>\n` +
               `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
@@ -281,7 +282,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('💎 <b>Pump.fun Heavy-Volume Momentum Bot Online ($25K+ Vol)</b>');
+  await sendTelegramAlert('💎 <b>Pump.fun Balanced Volume Bot Online ($10K+ Vol)</b>');
   startWebSocketListener();
 }
 
