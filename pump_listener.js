@@ -21,12 +21,12 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// --- EARLY MOMENTUM ENTRY TARGETS ($4K - $15K MC) ---
-const MIN_MARKET_CAP_USD = 4000;   // Catch them right as they gain traction
-const MAX_MARKET_CAP_USD = 15000;  // Ensure entry before the pump leaves you behind
-const MIN_RECENT_TXS = 4;          // Active trade velocity check
+// --- STRATEGY FILTERS ($4K - $15K MC) ---
+const MIN_MARKET_CAP_USD = 4000;
+const MAX_MARKET_CAP_USD = 15000;
 
 let activePositions = new Map();
+let lastCheckTime = 0; // Rate limit throttle tracker
 
 // --- TELEGRAM NOTIFICATION HELPER ---
 async function sendTelegramAlert(message) {
@@ -85,9 +85,10 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
   }
 }
 
-// --- EARLY ACCUMULATION EVALUATION ---
+// --- LIGHTWEIGHT API EVALUATION (NO RPC SPAM) ---
 async function evaluateEarlySetup(mintAddress) {
   try {
+    // Using Pump.fun frontend API directly avoids heavy RPC calls and 429 errors
     const res = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
     if (!res.ok) return false;
     const coinData = await res.json();
@@ -95,13 +96,7 @@ async function evaluateEarlySetup(mintAddress) {
     const solPriceUsd = 200;
     const marketCapUsd = coinData.usd_market_cap || ((coinData.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
 
-    // Target the early $4K - $15K breakout window
     if (marketCapUsd < MIN_MARKET_CAP_USD || marketCapUsd > MAX_MARKET_CAP_USD) {
-      return false;
-    }
-
-    const signatures = await connection.getSignaturesForAddress(new PublicKey(mintAddress), { limit: 8 });
-    if (signatures.length < MIN_RECENT_TXS) {
       return false;
     }
 
@@ -126,7 +121,6 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
 
       const pnlPercentage = ((currentPrice - buyPrice) / buyPrice) * 100;
 
-      // 1. Partial Take Profit: Lock 60% profit at +8%
       if (pnlPercentage >= 8 && !tookPartialProfit) {
         tookPartialProfit = true;
         const sellAmount = Math.floor(remainingTokens * 0.6);
@@ -141,7 +135,6 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         );
       }
 
-      // 2. Trailing Stop Loss & Risk Safeguards
       const dropFromPeak = ((peakPrice - currentPrice) / peakPrice) * 100;
       const isTimeout = Date.now() - entryTime > 180000;
 
@@ -168,7 +161,7 @@ function startWebSocket() {
   const ws = new WebSocket(WSS_ENDPOINT);
 
   ws.on('open', () => {
-    console.log('⚡ Connected to Solana WSS Stream - Early Gem Hunter Active');
+    console.log('⚡ Connected to Solana WSS Stream - Rate-Limit Protected');
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -182,6 +175,11 @@ function startWebSocket() {
 
   ws.on('message', async (data) => {
     try {
+      // Throttle: Process at most 1 log every 1500ms to prevent 429 rate limits
+      const now = Date.now();
+      if (now - lastCheckTime < 1500) return;
+      lastCheckTime = now;
+
       const response = JSON.parse(data);
       if (!response.params?.result?.value) return;
 
@@ -244,7 +242,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Configured for Early $4K-$15K Market Cap Breakouts.`
+    `Status: Rate-limit protected & scanning for breakouts.`
   );
   startWebSocket();
 }
