@@ -18,8 +18,8 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// --- STRATEGY TARGETS ($4K - $35K MC Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 4000;
+// --- STRATEGY TARGETS ($3K - $35K MC Sweet Spot) ---
+const MIN_MARKET_CAP_USD = 3000;  // Lowered to $3K to catch initial entries like $3.37K
 const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
@@ -133,7 +133,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
 
 // --- API SCANNER LOOP WITH STATUS LOGS ---
 async function startScanner() {
-  console.log('⚡ Pump.fun API Scanner Active - Scanning $4K-$35K Range...');
+  console.log('⚡ Pump.fun API Scanner Active - Scanning $3K-$35K Range...');
   
   setInterval(async () => {
     try {
@@ -141,7 +141,7 @@ async function startScanner() {
       if (!res.ok) return;
       const coins = await res.json();
 
-      console.log(`🔍 Checked ${coins.length} recent launches. Scanning for $4K-$35K sweet spot...`);
+      console.log(`🔍 Checked ${coins.length} recent launches. Scanning for $3K-$35K sweet spot...`);
 
       for (const coin of coins) {
         const mintAddress = coin.mint;
@@ -155,7 +155,7 @@ async function startScanner() {
           console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
 
           await sendTelegramAlert(
-            `🎯 <b>Momentum Target Found ($4K-$35K MC)!</b>\n` +
+            `🎯 <b>Momentum Target Found ($3K-$35K MC)!</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
             `Market Cap: $${marketCapUsd.toFixed(0)}\n` +
             `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
@@ -181,7 +181,7 @@ async function startScanner() {
     } catch (err) {
       console.error('Scanner error:', err.message);
     }
-  }, 4000); // Scans every 4 seconds cleanly
+  }, 4000);
 }
 
 // --- BOT INITIALIZATION ---
@@ -190,7 +190,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Active Scan Mode ($4K-$35K).`
+    `Status: Active Scan Mode ($3K-$35K).`
   );
   startScanner();
 }
