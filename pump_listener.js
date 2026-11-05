@@ -23,7 +23,7 @@ const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 // --- OPTIMIZED TARGETS ($50K - $120K MC, $10K+ Hourly Volume) ---
 const MIN_MARKET_CAP_USD = 50000;  
 const MAX_MARKET_CAP_USD = 120000; 
-const MIN_HOURLY_VOLUME_USD = 10000; // Adjusted to $10K for balanced filtering
+const MIN_HOURLY_VOLUME_USD = 10000;
 
 // --- RISK MANAGEMENT ---
 const STOP_LOSS_PERCENT = -10;     
