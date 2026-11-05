@@ -138,75 +138,83 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
   }
 }
 
-// --- WEBSOCKET ENGINE WITH VERBOSE LOGGING ---
+// --- WEBSOCKET ENGINE ---
 function startWebSocketListener() {
   console.log('⚡ Connecting to PumpPortal Real-Time Engine...');
   
   globalWs = new WebSocket('wss://pumpportal.fun/api/data');
 
   globalWs.on('open', () => {
-    console.log('🟢 Connected to PumpPortal. Subscribing to new token feed...');
+    console.log('🟢 Connected. Subscribing to trade and creation feeds...');
+    // Subscribe to both general trades and new tokens to catch existing and new waves
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
+    globalWs.send(JSON.stringify({ method: 'subscribeTrade' }));
   });
 
   globalWs.on('message', async (data) => {
     try {
       const event = JSON.parse(data.toString());
-      
-      // VERBOSE LOG: Prints incoming stream events so you see activity in Railway
-      console.log(`📥 Stream Event Received -> Mint: ${event.mint ? event.mint.slice(0, 6) : 'N/A'} | Type: ${event.txType || 'creation'} | MC: $${event.usd_market_cap || event.marketCapUsd || 'unknown'}`);
-
       if (!event || !event.mint) return;
+
       const mintAddress = event.mint;
 
       if (activePositions.has(mintAddress)) {
-        const currentMc = event.usd_market_cap || (event.marketCapSol * 200) || 0;
+        const currentMc = event.marketCapUsd || event.usd_market_cap || ((event.vSolInBondingCurve || event.virtualSolReserves / 1e9 || 0) * 200 * 5) || 0;
         if (currentMc > 0) await evaluatePositionRealtime(mintAddress, currentMc);
         return;
       }
 
+      // Calculate accurate Market Cap from bonding curve SOL reserves or fields provided in trade events
       const solPriceUsd = 200;
-      const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
+      const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0);
+      const marketCapUsd = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
 
-      console.log(`🔎 Evaluating token ${mintAddress.slice(0, 6)}... Market Cap: $${marketCapUsd.toFixed(0)}`);
+      // If market cap calculation is valid and above zero, evaluate it
+      if (marketCapUsd > 0) {
+        console.log(`🔎 Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Type: ${event.txType || 'creation'}`);
 
-      if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
-        let stats = tokenMetrics.get(mintAddress);
-        if (!stats) {
-          stats = { buyCount: 0, volumeSol: 0 };
-          tokenMetrics.set(mintAddress, stats);
-        }
+        if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
+          let stats = tokenMetrics.get(mintAddress);
+          if (!stats) {
+            stats = { buyCount: 0, volumeSol: 0 };
+            tokenMetrics.set(mintAddress, stats);
+          }
 
-        stats.buyCount += 1;
-        stats.volumeSol += Number(event.solAmount || 0.2);
+          if (event.txType === 'buy') {
+            stats.buyCount += 1;
+            stats.volumeSol += Number(event.solAmount || 0.2);
+          } else {
+            stats.buyCount += 1; // Count creation or general movement as initial engagement
+          }
 
-        console.log(`🎯 MATCHED SWEET SPOT! Token: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount}`);
+          console.log(`🎯 SWEET SPOT MATCH: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount}`);
 
-        if (stats.buyCount >= 2 && stats.volumeSol >= 0.5 && !processedMints.has(mintAddress)) {
-          processedMints.add(mintAddress);
-          tokenMetrics.delete(mintAddress);
+          if (stats.buyCount >= 2 && !processedMints.has(mintAddress)) {
+            processedMints.add(mintAddress);
+            tokenMetrics.delete(mintAddress);
 
-          console.log(`🌊 MOMENTUM WAVE LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
+            console.log(`🌊 MOMENTUM WAVE LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
 
-          const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
+            const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
-          if (buyTx) {
-            console.log(`✅ Wave buy completed for: ${mintAddress}`);
-            
-            activePositions.set(mintAddress, {
-              entryMc: marketCapUsd,
-              peakMc: marketCapUsd,
-              entryTime: Date.now(),
-              remainingTokens: TRADE_AMOUNT_SOL,
-              tookPartialProfit: false
-            });
+            if (buyTx) {
+              console.log(`✅ Wave buy completed for: ${mintAddress}`);
+              
+              activePositions.set(mintAddress, {
+                entryMc: marketCapUsd,
+                peakMc: marketCapUsd,
+                entryTime: Date.now(),
+                remainingTokens: TRADE_AMOUNT_SOL,
+                tookPartialProfit: false
+              });
 
-            await sendTelegramAlert(
-              `🌊 <b>Wave Entry Triggered</b>\n` +
-              `Mint: <code>${mintAddress}</code>\n` +
-              `Entry MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
-              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-            );
+              await sendTelegramAlert(
+                `🌊 <b>Wave Entry Triggered</b>\n` +
+                `Mint: <code>${mintAddress}</code>\n` +
+                `Entry MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
+                `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+              );
+            }
           }
         }
       }
@@ -231,7 +239,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Wave Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Verbose Log Scanner Active ($4K-$50K MC).`
+    `Status: Multi-Feed Stream Active ($4K-$50K MC).`
   );
   startWebSocketListener();
 }
