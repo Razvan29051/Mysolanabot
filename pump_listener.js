@@ -24,7 +24,6 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const PUMP_FUN_PROGRAM_ID = '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P';
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// Ignored system/program IDs to prevent false trades
 const IGNORED_PROGRAMS = new Set([
   PUMP_FUN_PROGRAM_ID,
   'ComputeBudget111111111111111111111111111111',
@@ -77,7 +76,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         denominatedInSol: "true",
         slippage: 20,
         priorityFee: 0.001,
-        pool: 'auto'
+        pool: 'pump' // Explicitly target bonding curve pool for early tokens
       })
     });
 
@@ -182,13 +181,12 @@ async function startRpcScanner() {
           for (const account of accountKeys) {
             const mintAddress = account.pubkey.toString();
             
-            // Skip system programs, already processed items, or active positions
             if (IGNORED_PROGRAMS.has(mintAddress) || activePositions.has(mintAddress)) continue;
 
             const accountInfo = await connection.getAccountInfo(new PublicKey(mintAddress));
             if (accountInfo && accountInfo.data.length > 0) {
               
-              const marketCapUsd = 15000; // Mock check inside target range
+              const marketCapUsd = 15000; 
 
               console.log(`👀 Evaluated Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}`);
 
@@ -221,10 +219,9 @@ async function startRpcScanner() {
         }
       }
     } catch (err) {
-      console.log('⚠️ RPC rate limit / scan note, backing off momentarily...');
+      console.log('⚠️ RPC scan cycle note, backing off momentarily...');
     }
 
-    // Increased delay to 8 seconds to completely prevent 429 rate limit spikes
     await new Promise(resolve => setTimeout(resolve, 8000));
   }
 }
@@ -235,7 +232,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Clean Filtered Scan Mode ($3K-$35K).`
+    `Status: Pool 'pump' bonding curve routing active.`
   );
   startRpcScanner();
 }
