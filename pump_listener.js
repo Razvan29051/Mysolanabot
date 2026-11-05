@@ -4,7 +4,6 @@ import bs58 from 'bs58';
 // --- CONFIGURATION & ENV VARS ---
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || process.env.RPC_URL;
 const RAW_PRIVATE_KEY = process.env.PRIVATE_KEY || process.env.BOT_PRIVATE_KEY;
-const PUMP_PORTAL_API_KEY = process.env.PUMP_PORTAL_API_KEY; // Optional, can be left blank if not required by local route
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -52,21 +51,20 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Uses your existing wallet) ---
+// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Binary Buffer Handled) ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
     console.log(`🔄 Requesting local Pump.fun ${action} transaction for ${mintAddress} using your wallet (${amountSol} SOL)...`);
 
-    // Using /api/trade-local to build the transaction for YOUR public key
     const response = await fetch(`https://pumpportal.fun/api/trade-local`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        publicKey: wallet.publicKey.toString(), // Passes your active bot wallet public key
-        action: action, // 'buy' or 'sell'
-        mint: mintAddress, // Target token mint
-        amount: amountSol, // SOL amount
-        denominatedInSol: 'true',
+        publicKey: wallet.publicKey.toString(),
+        action: action,
+        mint: mintAddress,
+        amount: amountSol,
+        denominatedInSol: "true",
         slippage: 15,
         priorityFee: 0.0005,
         pool: 'pump'
@@ -78,14 +76,9 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
       throw new Error(`PumpPortal Local API status ${response.status}: ${errText}`);
     }
 
-    const data = await response.json();
-    if (!data || !data.tx) {
-      throw new Error('No transaction data returned from PumpPortal Local API');
-    }
-
-    // Sign the transaction locally with your existing private key
-    const txBuf = Buffer.from(data.tx, 'base64');
-    const transaction = VersionedTransaction.deserialize(txBuf);
+    // Read the raw binary transaction bytes correctly
+    const arrayBuffer = await response.arrayBuffer();
+    const transaction = VersionedTransaction.deserialize(new Uint8Array(arrayBuffer));
     transaction.sign([wallet]);
 
     const txid = await connection.sendTransaction(transaction, {
