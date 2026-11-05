@@ -94,7 +94,7 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Subscribing to token feeds with trailing risk engine...\n');
+    process.stdout.write('🟢 Connected! Subscribing to bonding curve momentum feeds...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -113,7 +113,6 @@ function startWebSocketListener() {
       if (activePositions.has(mintAddress) && currentMc > 0) {
         const pos = activePositions.get(mintAddress);
         
-        // Update peak market cap if price goes higher
         if (currentMc > pos.highestMc) {
           pos.highestMc = currentMc;
           activePositions.set(mintAddress, pos);
@@ -124,22 +123,17 @@ function startWebSocketListener() {
 
         let exitReason = null;
 
-        // Check Hard Stop-Loss (-8%)
         if (pnlPercent <= INITIAL_STOP_LOSS_PERCENT) {
           exitReason = `Stop-Loss Triggered (${pnlPercent.toFixed(1)}%)`;
-        } 
-        // Check Trailing Stop (If token went up more than 10%, trail it and exit if it drops 7% from peak)
-        else if (pnlPercent > 10 && dropFromPeak <= TRAILING_DROP_PERCENT) {
-          exitReason = `Trailing Profit Lock Triggered (Peak PnL was +${((pos.highestMc - pos.entryMc) / pos.entryMc * 100).toFixed(1)}%, dropped to current)`;
-        } 
-        // Check Hard Take-Profit (+45%)
-        else if (pnlPercent >= TAKE_PROFIT_PERCENT) {
+        } else if (pnlPercent > 10 && dropFromPeak <= TRAILING_DROP_PERCENT) {
+          exitReason = `Trailing Profit Lock Triggered (Peak PnL: +${((pos.highestMc - pos.entryMc) / pos.entryMc * 100).toFixed(1)}%)`;
+        } else if (pnlPercent >= TAKE_PROFIT_PERCENT) {
           exitReason = `Take-Profit Target Reached (+${pnlPercent.toFixed(1)}%)`;
         }
 
         if (exitReason) {
           activePositions.delete(mintAddress);
-          process.stdout.write(`🔴 EXITTING POSITION: ${mintAddress.slice(0, 6)}... | Reason: ${exitReason}\n`);
+          process.stdout.write(`🔴 EXITING POSITION: ${mintAddress.slice(0, 6)}... | Reason: ${exitReason}\n`);
           
           const sellTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
           if (sellTx) {
@@ -155,11 +149,11 @@ function startWebSocketListener() {
         }
       }
 
-      // 2. INSTANT LAUNCH ENTRY TRIGGER
+      // 2. INSTANT MOMENTUM ENTRY TRIGGER
       if (!processedMints.has(mintAddress) && currentMc > 0) {
         processedMints.add(mintAddress);
 
-        process.stdout.write(`🚀 SNIPING NEW LAUNCH: ${mintAddress.slice(0, 6)}... | Initial MC: ~$${currentMc.toFixed(0)}\n`);
+        process.stdout.write(`🚀 SNIPING MOMENTUM LAUNCH: ${mintAddress.slice(0, 6)}... | Est. MC: ~$${currentMc.toFixed(0)}\n`);
         const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
         if (buyTx) {
@@ -170,7 +164,7 @@ function startWebSocketListener() {
           });
 
           await sendTelegramAlert(
-            `🚀 <b>New Token Snipe Entry!</b>\n` +
+            `🚀 <b>Momentum Snipe Entry!</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
             `Entry MC: <b>~$${currentMc.toFixed(0)}</b>\n` +
             `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
@@ -191,7 +185,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('⚡ <b>Pump.fun Trailing Stop Bot Online (-8% SL / Trailing Profit)</b>');
+  await sendTelegramAlert('⚡ <b>Pump.fun Momentum Bot Online (-8% SL & Trailing Stop)</b>');
   startWebSocketListener();
 }
 
