@@ -21,9 +21,9 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// --- STRATEGY FILTERS ($4K - $15K MC) ---
-const MIN_MARKET_CAP_USD = 4000;
-const MAX_MARKET_CAP_USD = 15000;
+// --- OPTIMIZED STRATEGY TARGETS ($8K - $35K MC Sweet Spot) ---
+const MIN_MARKET_CAP_USD = 8000;
+const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
 let lastCheckTime = 0;
@@ -86,8 +86,8 @@ async function executeSwap(inputMint, outputMint, amountLamports) {
   }
 }
 
-// --- LIGHTWEIGHT API EVALUATION ---
-async function evaluateEarlySetup(mintAddress) {
+// --- EVALUATE MARKET CAP MOMENTUM ---
+async function evaluateTokenSetup(mintAddress) {
   try {
     const res = await fetch(`https://frontend-api.pump.fun/coins/${mintAddress}`);
     if (!res.ok) return false;
@@ -96,11 +96,13 @@ async function evaluateEarlySetup(mintAddress) {
     const solPriceUsd = 200;
     const marketCapUsd = coinData.usd_market_cap || ((coinData.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
 
+    console.log(`🔍 Checking token ${mintAddress.slice(0, 6)}... MC: $${marketCapUsd.toFixed(0)}`);
+
     if (marketCapUsd < MIN_MARKET_CAP_USD || marketCapUsd > MAX_MARKET_CAP_USD) {
       return false;
     }
 
-    console.log(`💎 EARLY GEM LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
+    console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
     return true;
   } catch (error) {
     return false;
@@ -161,8 +163,8 @@ function startWebSocket() {
   const ws = new WebSocket(WSS_ENDPOINT);
 
   ws.on('open', () => {
-    console.log('⚡ Connected to Solana WSS Stream - Rate-Limit Protected');
-    reconnectAttempts = 0; // Reset backoff on success
+    console.log('⚡ Connected to Solana WSS Stream - Scanning Momentum Setups');
+    reconnectAttempts = 0;
     ws.send(JSON.stringify({
       jsonrpc: '2.0',
       id: 1,
@@ -177,7 +179,7 @@ function startWebSocket() {
   ws.on('message', async (data) => {
     try {
       const now = Date.now();
-      if (now - lastCheckTime < 2000) return; // Increased throttle to 2s to protect RPC limits
+      if (now - lastCheckTime < 1000) return; // Responsive 1s throttle
       lastCheckTime = now;
 
       const response = JSON.parse(data);
@@ -186,41 +188,38 @@ function startWebSocket() {
       const logs = response.params.result.value.logs || [];
       const signature = response.params.result.value.signature;
 
-      const isBuyActivity = logs.some(log => log.includes('Instruction: Buy'));
+      // Listen for any transaction interaction involving pump.fun program
+      const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
+      if (!txInfo || !txInfo.transaction) return;
 
-      if (isBuyActivity) {
-        const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
-        if (!txInfo) return;
+      const accountKeys = txInfo.transaction.message.accountKeys;
+      const mintAccount = accountKeys.find(a => a.writable && !a.signer);
+      const mintAddress = mintAccount?.pubkey?.toString();
 
-        const accountKeys = txInfo.transaction.message.accountKeys;
-        const mintAccount = accountKeys.find(a => a.writable && !a.signer);
-        const mintAddress = mintAccount?.pubkey?.toString();
+      if (!mintAddress || activePositions.has(mintAddress)) return;
 
-        if (!mintAddress || activePositions.has(mintAddress)) return;
+      const isQualified = await evaluateTokenSetup(mintAddress);
 
-        const isQualified = await evaluateEarlySetup(mintAddress);
+      if (isQualified) {
+        activePositions.set(mintAddress, true);
 
-        if (isQualified) {
-          activePositions.set(mintAddress, true);
+        await sendTelegramAlert(
+          `🎯 <b>Momentum Target Found ($8K-$35K MC)!</b>\n` +
+          `Mint: <code>${mintAddress}</code>\n` +
+          `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
+        );
 
+        const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
+
+        if (buyTx) {
           await sendTelegramAlert(
-            `🎯 <b>Early Gem Found ($4K-$15K MC)!</b>\n` +
+            `✅ <b>Position Entered</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
-            `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
+            `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
           );
-
-          const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
-
-          if (buyTx) {
-            await sendTelegramAlert(
-              `✅ <b>Position Entered</b>\n` +
-              `Mint: <code>${mintAddress}</code>\n` +
-              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-            );
-            monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
-          } else {
-            activePositions.delete(mintAddress);
-          }
+          monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
+        } else {
+          activePositions.delete(mintAddress);
         }
       }
     } catch (err) {}
@@ -232,8 +231,7 @@ function startWebSocket() {
 
   ws.on('close', () => {
     reconnectAttempts++;
-    // Exponential backoff: Wait longer with each consecutive failure (e.g., 5s, 10s, 15s...)
-    const delay = Math.min(reconnectAttempts * 5000, 30000);
+    const delay = Math.min(reconnectAttempts * 3000, 20000);
     console.log(`⚠️ WebSocket disconnected. Reconnecting in ${delay / 1000} seconds...`);
     setTimeout(startWebSocket, delay);
   });
@@ -245,7 +243,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Safe backoff mode active & scanning breakouts.`
+    `Status: Active scan mode ($8K-$35K Market Cap range).`
   );
   startWebSocket();
 }
