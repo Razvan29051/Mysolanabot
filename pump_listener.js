@@ -51,7 +51,7 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Auto Pool & Clean Payload) ---
+// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Corrected String Parameters) ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
     console.log(`🔄 Requesting local trade for ${mintAddress} (${amountSol} SOL, action: ${action})...`);
@@ -64,10 +64,10 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         action: action,
         mint: mintAddress,
         amount: amountSol,
-        denominatedInSol: true,
+        denominatedInSol: "true", // Must be a string per PumpPortal specs
         slippage: 15,
         priorityFee: 0.0005,
-        pool: 'auto' // Automatically routes between bonding curve and AMM pools
+        pool: 'auto'
       })
     });
 
@@ -224,7 +224,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Local Transaction Mode ($3K-$35K). Auto-pool routing enabled.`
+    `Status: Local Transaction Mode ($3K-$35K). Parameter fix applied.`
   );
   startRpcScanner();
 }
