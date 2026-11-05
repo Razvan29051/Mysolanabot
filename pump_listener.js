@@ -20,15 +20,15 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- SAFER TARGETS ($15K - $50K Market Cap) ---
-const MIN_MARKET_CAP_USD = 15000; 
-const MAX_MARKET_CAP_USD = 50000;
+// --- HIGH MOMENTUM TARGETS ($30K - $100K Market Cap) ---
+const MIN_MARKET_CAP_USD = 30000; // Filter out low-cap traps
+const MAX_MARKET_CAP_USD = 100000; // Upper limit before bonding curve completion
 
-// Risk Management Limits
-const STOP_LOSS_PERCENT = -10;     // Sell if down 10%
-const TAKE_PROFIT_PERCENT = 22;    // Sell partial if up 22%
+// --- AUTOMATED RISK MANAGEMENT ---
+const STOP_LOSS_PERCENT = -12;     // Auto-sell if position drops 12%
+const TAKE_PROFIT_PERCENT = 35;    // Auto-sell if position gains 35%
 
-let activePositions = new Map(); // Tracks open trades for stop-loss / take-profit
+let activePositions = new Map(); // Map<mintAddress, { entryMc, amountSol }
 let processedMints = new Set();
 let trackedMints = new Set();
 let globalWs = null;
@@ -55,7 +55,7 @@ async function sendTelegramAlert(message) {
 // --- LOCAL SWAP EXECUTION ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
-    process.stdout.write(`🔄 Requesting ${action} for ${mintAddress} (${amountSol} SOL)...\n`);
+    process.stdout.write(`🔄 Requesting ${action.toUpperCase()} order for ${mintAddress} (${amountSol} SOL)...\n`);
 
     const response = await fetch(`https://pumpportal.fun/api/trade-local`, {
       method: 'POST',
@@ -64,10 +64,10 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         publicKey: wallet.publicKey.toString(),
         action: action,
         mint: mintAddress,
-        amount: amountSol,
-        denominatedInSol: "true",
-        slippage: 25,
-        priorityFee: 0.0015,
+        amount: action === 'sell' ? '100%' : amountSol,
+        denominatedInSol: action === 'sell' ? 'false' : 'true',
+        slippage: 30,
+        priorityFee: 0.002,
         pool: 'auto'
       })
     });
@@ -79,10 +79,10 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
     transaction.sign([wallet]);
 
     const txid = await connection.sendTransaction(transaction, { skipPreflight: true, maxRetries: 3 });
-    process.stdout.write(`✅ Transaction Executed (${action}): ${txid}\n`);
+    process.stdout.write(`✅ Transaction Executed (${action.toUpperCase()}): ${txid}\n`);
     return txid;
   } catch (err) {
-    process.stdout.write(`❌ Trade Execution Failed: ${err.message}\n`);
+    process.stdout.write(`❌ Trade Execution Failed (${action.toUpperCase()}): ${err.message}\n`);
     return null;
   }
 }
@@ -102,7 +102,7 @@ function subscribeToMints(mintArray) {
   }));
 }
 
-// --- FETCH TOP RISING PUMP.FUN TOKENS FROM DEXSCREENER ---
+// --- FETCH RISING $30K-$100K TOKENS FROM DEXSCREENER ---
 async function fetchTopActiveMints() {
   try {
     const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump');
@@ -124,20 +124,19 @@ async function fetchTopActiveMints() {
       if (!processedMints.has(mintAddress)) {
         processedMints.add(mintAddress);
 
-        process.stdout.write(`🌊 DEXSCREENER MATCH: ${mintAddress} (MC: $${pair.marketCap}) -> Executing Buy...\n`);
+        process.stdout.write(`🚀 HIGH MOMENTUM MATCH: ${mintAddress} (MC: $${pair.marketCap.toFixed(0)}) -> Buying...\n`);
         const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
         if (buyTx) {
-          // Record position for risk management tracking
           activePositions.set(mintAddress, {
             entryMc: pair.marketCap,
             buyTime: Date.now()
           });
 
           await sendTelegramAlert(
-            `🌊 <b>Target Buy Executed!</b>\n` +
+            `🚀 <b>High Momentum Entry!</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
-            `Entry MC: <b>$${pair.marketCap}</b>\n` +
+            `Entry MC: <b>$${pair.marketCap.toFixed(0)}</b>\n` +
             `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
           );
         }
@@ -151,12 +150,7 @@ async function fetchTopActiveMints() {
   }
 }
 
-// --- RISK MANAGEMENT LOOP ---
-function monitorActivePositions() {
-  // Can be expanded to check active positions against live websocket prices and trigger sell() when hitting stop-loss/take-profit thresholds.
-}
-
-// --- WEBSOCKET ENGINE ---
+// --- WEBSOCKET ENGINE & LIVE POSITION MONITORING ---
 function startWebSocketListener() {
   process.stdout.write('⚡ Connecting to PumpPortal Stream Engine...\n');
   
@@ -167,12 +161,11 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Subscribing to streams...\n');
+    process.stdout.write('🟢 Connected! Subscribing to token streams...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
-    // Poll DexScreener every 15 seconds for active momentum coins
     fetchTopActiveMints();
-    setInterval(fetchTopActiveMints, 15000);
+    setInterval(fetchTopActiveMints, 12000);
   });
 
   globalWs.on('message', async (data) => {
@@ -188,26 +181,60 @@ function startWebSocketListener() {
 
       const solPriceUsd = 200;
       const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0);
-      const marketCapUsd = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
+      const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
 
-      // Trigger condition: Live BUY trade inside safe range ($15K - $50K)
-      if (event.txType === 'buy' && marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
+      // 1. LIVE POSITION STOP-LOSS / TAKE-PROFIT CHECK
+      if (activePositions.has(mintAddress) && currentMc > 0) {
+        const pos = activePositions.get(mintAddress);
+        const pnlPercent = ((currentMc - pos.entryMc) / pos.entryMc) * 100;
+
+        if (pnlPercent <= STOP_LOSS_PERCENT) {
+          activePositions.delete(mintAddress);
+          process.stdout.write(`🔴 STOP-LOSS TRIGGERED: ${mintAddress.slice(0, 6)}... (${pnlPercent.toFixed(1)}%)\n`);
+          
+          const sellTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
+          if (sellTx) {
+            await sendTelegramAlert(
+              `🔴 <b>Stop-Loss Executed</b>\n` +
+              `Mint: <code>${mintAddress}</code>\n` +
+              `PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
+              `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
+            );
+          }
+        } else if (pnlPercent >= TAKE_PROFIT_PERCENT) {
+          activePositions.delete(mintAddress);
+          process.stdout.write(`🟢 TAKE-PROFIT TRIGGERED: ${mintAddress.slice(0, 6)}... (+${pnlPercent.toFixed(1)}%)\n`);
+
+          const sellTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
+          if (sellTx) {
+            await sendTelegramAlert(
+              `🟢 <b>Take-Profit Executed! 🎉</b>\n` +
+              `Mint: <code>${mintAddress}</code>\n` +
+              `PnL: <b>+${pnlPercent.toFixed(1)}%</b>\n` +
+              `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
+            );
+          }
+        }
+      }
+
+      // 2. LIVE BUY ENTRY TRIGGER ($30K - $100K RANGE)
+      if (event.txType === 'buy' && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
         if (!processedMints.has(mintAddress)) {
           processedMints.add(mintAddress);
 
-          process.stdout.write(`🌊 STREAM BUY MATCH: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}\n`);
+          process.stdout.write(`🚀 STREAM BUY MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)}\n`);
           const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
           if (buyTx) {
             activePositions.set(mintAddress, {
-              entryMc: marketCapUsd,
+              entryMc: currentMc,
               buyTime: Date.now()
             });
 
             await sendTelegramAlert(
-              `🌊 <b>Stream Buy Executed!</b>\n` +
+              `🚀 <b>Stream Entry Bought!</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
-              `MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
+              `MC: <b>$${currentMc.toFixed(0)}</b>\n` +
               `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
             );
           }
@@ -221,16 +248,15 @@ function startWebSocketListener() {
   globalWs.on('error', (err) => process.stdout.write(`❌ WS Error: ${err.message}\n`));
   globalWs.on('close', () => {
     trackedMints.clear();
-    process.stdout.write('⚠️ Disconnected. Reconnecting in 5 seconds...\n');
+    process.stdout.write('⚠️ Disconnected. Reconnecting in 5s...\n');
     setTimeout(startWebSocketListener, 5000);
   });
 }
 
 async function main() {
-  process.stdout.write(`🔑 Bot Wallet Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('🚀 <b>Pump.fun Trading Bot Online</b>');
+  process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
+  await sendTelegramAlert('🚀 <b>Pump.fun High-Momentum Bot Online ($30K-$100K)</b>');
   startWebSocketListener();
-  setInterval(monitorActivePositions, 10000);
 }
 
 main();
