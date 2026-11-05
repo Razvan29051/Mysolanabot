@@ -131,11 +131,11 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- RATE-LIMITED SAFE SCANNER ---
+// --- SAFE SCANNER WITH VISIBLE LOGGING ---
 async function startScanner() {
-  console.log('⚡ Rate-Limited Safe Scanner Active - Scanning $3K-$35K Range...');
+  console.log('⚡ Safe Scanner Active - Scanning $3K-$35K Range...');
   runScanCycle();
-  setInterval(runScanCycle, 5000); // Clean 5-second interval prevents any rate limits
+  setInterval(runScanCycle, 5000);
 }
 
 async function runScanCycle() {
@@ -150,18 +150,28 @@ async function runScanCycle() {
     });
 
     if (!res.ok) {
-      return; // Silently skip if temporary network blip occurs
+      console.log(`⚠️ API status: ${res.status}`);
+      return;
     }
 
     const coins = await res.json();
     if (!Array.isArray(coins)) return;
 
+    console.log(`🔍 Checked ${coins.length} coins. Scanning for $3K-$35K targets...`);
+
     for (const coin of coins) {
       const mintAddress = coin.mint;
-      if (!mintAddress || processedMints.has(mintAddress) || activePositions.has(mintAddress)) continue;
+      if (!mintAddress) continue;
 
       const solPriceUsd = 200;
       const marketCapUsd = coin.usd_market_cap || ((coin.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
+
+      // Print tokens that are close or inside the range for visibility
+      if (marketCapUsd >= 1000 && marketCapUsd <= 50000) {
+        console.log(`👀 Seen: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)}`);
+      }
+
+      if (processedMints.has(mintAddress) || activePositions.has(mintAddress)) continue;
 
       if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
         processedMints.add(mintAddress);
@@ -192,7 +202,7 @@ async function runScanCycle() {
       }
     }
   } catch (err) {
-    // Suppress console spam
+    console.error('Scan error:', err.message);
   }
 }
 
