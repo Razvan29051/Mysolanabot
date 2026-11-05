@@ -8,6 +8,27 @@ const RPC_URL = process.env.RPC_URL || "https://api.mainnet-beta.solana.com";
 const PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
+// Telegram Configuration
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegramAlert(message) {
+  if (!TG_TOKEN || !TG_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: message,
+        parse_mode: 'Markdown'
+      })
+    });
+  } catch (err) {
+    console.log('⚠️ Telegram alert failed:', err.message);
+  }
+}
+
 const connection = new Connection(RPC_URL, 'confirmed');
 
 let wallet;
@@ -18,6 +39,7 @@ try {
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
   console.log(`🔑 [Wallet] Momentum Rider Active: ${wallet.publicKey.toString()}`);
+  sendTelegramAlert(`🚀 *Sniper Bot Online*\nWallet: \`${wallet.publicKey.toString()}\``);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -114,26 +136,21 @@ async function hasStrongBuyPressure(tokenMint) {
 
     const lastTradesBuyHeavy = buyCount >= sellCount + 1;
     const volumeBuyHeavy = buyVolume > sellVolume * 1.2;
-
-    const strong = lastTradesBuyHeavy && volumeBuyHeavy;
-
-    console.log(`📊 Buy Pressure → Buys: ${buyCount} | Sells: ${sellCount} | Vol ratio: ${(buyVolume / (sellVolume || 1)).toFixed(2)}x → ${strong ? 'PASS' : 'FAIL'}`);
-
-    return strong;
+    return lastTradesBuyHeavy && volumeBuyHeavy;
   } catch (err) {
-    console.log('⚠️ Buy pressure check failed, skipping trade');
     return false;
   }
 }
 
 async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSolSpent) {
   console.log(`👀 Tracking ${tokenMint.slice(0, 8)}...`);
+  sendTelegramAlert(`👀 *Tracking Token*\nMint: \`${tokenMint}\``);
 
   let peakValue = initialSolSpent;
   let remainingUnits = BigInt(buyAmountUnits);
   let hasTakenPartial = false;
   const startTime = Date.now();
-  const maxHoldTimeMs = 2 * 60 * 1000; // Max 2 minutes
+  const maxHoldTimeMs = 2 * 60 * 1000;
 
   const checkInterval = setInterval(async () => {
     try {
@@ -152,44 +169,36 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
       if (currentValueSol > peakValue) peakValue = currentValueSol;
 
       const pnlPct = ((currentValueSol / initialSolSpent) - 1) * 100;
-      const color = pnlPct >= 0 ? '\x1b[32m' : '\x1b[31m';
-      console.log(`${color}📈 ${currentValueSol.toFixed(4)} SOL | Peak ${peakValue.toFixed(4)} | ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%\x1b[0m`);
 
       // Partial take-profit at +8%
       if (!hasTakenPartial && currentValueSol >= initialSolSpent * 1.08) {
         const sellUnits = (remainingUnits * 60n) / 100n;
         if (sellUnits > 0n) {
-          console.log(`\x1b[32m💰 PARTIAL 60% @ +8%+\x1b[0m`);
+          console.log(`💰 PARTIAL 60% @ +8%+`);
           await executeSwap(tokenMint, SOL_MINT, sellUnits.toString());
+          sendTelegramAlert(`💰 *Partial Take-Profit (+8%)*\nSold 60% of position for token: \`${tokenMint.slice(0, 8)}\``);
           remainingUnits -= sellUnits;
           hasTakenPartial = true;
         }
       }
 
-      // Trailing stop: sell when drops 5% from peak
       const trailActive = peakValue >= initialSolSpent * 1.05;
-      const pullback = trailActive && currentValueSol < peakValue * 0.95; // ← 5% from peak
-      const stopLoss = currentValueSol <= initialSolSpent * 0.96;         // -4% hard stop
+      const pullback = trailActive && currentValueSol < peakValue * 0.95;
+      const stopLoss = currentValueSol <= initialSolSpent * 0.96;
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pullback || stopLoss || timedOut) {
         clearInterval(checkInterval);
 
-        const reason = pullback
-          ? `\x1b[32m🟢 TRAILING EXIT (5% from peak)\x1b[0m`
-          : stopLoss
-            ? `\x1b[31m🚨 STOP-LOSS\x1b[0m`
-            : `\x1b[33m⏰ TIMEOUT\x1b[0m`;
-
-        console.log(reason);
+        const reason = pullback ? "🟢 Trailing Exit (5% from peak)" : stopLoss ? "🚨 Stop-Loss" : "⏰ Timeout";
 
         if (remainingUnits > 0n) {
           const txid = await executeSwap(tokenMint, SOL_MINT, remainingUnits.toString());
-          console.log(`\x1b[32m✅ CLOSED → https://solscan.io/tx/${txid}\x1b[0m`);
+          console.log(`✅ CLOSED → https://solscan.io/tx/${txid}`);
+          sendTelegramAlert(`✅ *Position Closed*\nReason: ${reason}\nPnL: ${pnlPct.toFixed(1)}%\n[View on Solscan](https://solscan.io/tx/${txid})`);
         }
 
         isTrading = false;
-        console.log(`🔄 Ready for next target`);
       }
     } catch (e) {}
   }, 3500);
@@ -235,9 +244,6 @@ async function handleGraduationCandidate(signature) {
     const virtualSol = coinData.virtual_sol_reserves || 0;
     const graduationProgress = (virtualSol / 85_000_000_000) * 100;
 
-    console.log(`🔍 [Curve Check] Progress: ${graduationProgress.toFixed(1)}% | Virtual SOL: ${(virtualSol / 1e9).toFixed(1)}`);
-
-    // Momentum filters (avoid already pumped)
     if (graduationProgress < 25 || graduationProgress > 78 || virtualSol < 12_000_000_000) {
       isTrading = false;
       return;
@@ -245,18 +251,19 @@ async function handleGraduationCandidate(signature) {
 
     const pressureOk = await hasStrongBuyPressure(newMint);
     if (!pressureOk) {
-      console.log(`❌ Weak buy pressure — skipping`);
       isTrading = false;
       return;
     }
 
     console.log(`🎯 Momentum detected → ENTERING`);
+    sendTelegramAlert(`🎯 *Momentum Entry Detected!*\nProgress: ${graduationProgress.toFixed(1)}%\nMint: \`${newMint}\``);
 
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
 
     const txid = await executeSwap(SOL_MINT, newMint, amountLamports);
     console.log(`✅ [ENTRY EXECUTED] Solscan: https://solscan.io/tx/${txid}`);
+    sendTelegramAlert(`🚀 *Entry Executed Successfully*\nAllocated: ${solToAllocate.toFixed(4)} SOL\n[View on Solscan](https://solscan.io/tx/${txid})`);
 
     setTimeout(async () => {
       try {
@@ -292,10 +299,6 @@ function startListener() {
         { commitment: "confirmed" }
       ]
     }));
-
-    setInterval(() => {
-      console.log(`💓 Still scanning... ${new Date().toLocaleTimeString()}`);
-    }, 60000);
   });
 
   ws.on('message', async (data) => {
