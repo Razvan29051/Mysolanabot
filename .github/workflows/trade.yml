@@ -1,18 +1,28 @@
-name: Free Autonomous Scalper Loop
+name: Pump Graduation Rider
+
 on:
-  workflow_dispatch:
+  workflow_dispatch:          # Allows manual start
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/30 * * * *'    # Restart every 30 minutes (safer)
 
 jobs:
   trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 25       # Stop before GitHub kills it
+
     steps:
-      - uses: actions/checkout@v3
-      - uses: oven-sh/setup-bun@v1
-      - run: bun install
-      - name: Run Multi-X Scalper Bot
-        run: bun run bot.js
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run Pump Listener Bot
+        run: bun run pump_listener.js
         env:
           BOT_PRIVATE_KEY: ${{ secrets.BOT_PRIVATE_KEY }}
           RPC_URL: ${{ secrets.RPC_URL }}
+          WS_URL: ${{ secrets.WS_URL }}
