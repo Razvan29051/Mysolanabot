@@ -17,7 +17,7 @@ try {
     raw = raw.slice(1, -1).trim();
   }
   wallet = Keypair.fromSecretKey(raw.startsWith('[') ? Uint8Array.from(JSON.parse(raw)) : bs58.decode(raw));
-  console.log(`🔑 [Wallet] Clean Graduation Rider Active: ${wallet.publicKey.toString()}`);
+  console.log(`🔑 [Wallet] Momentum Rider Active: ${wallet.publicKey.toString()}`);
 } catch (err) {
   console.error("❌ Private Key Error:", err.message);
   process.exit(1);
@@ -45,7 +45,7 @@ async function safeFetch(url, options = {}) {
 
 async function executeSwap(inputMint, outputMint, amountUnits) {
   const quoteRes = await safeFetch(
-    `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountUnits}&slippageBps=400`
+    `https://api.jup.ag/swap/v1/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountUnits}&slippageBps=500`
   );
   const quote = await quoteRes.json();
   if (quote.error) throw new Error(`Quote Error: ${quote.error}`);
@@ -113,7 +113,7 @@ async function hasStrongBuyPressure(tokenMint) {
     }
 
     const lastTradesBuyHeavy = buyCount >= sellCount + 1;
-    const volumeBuyHeavy = buyVolume > sellVolume * 1.15; // relaxed for ~70% win rate
+    const volumeBuyHeavy = buyVolume > sellVolume * 1.2;
 
     const strong = lastTradesBuyHeavy && volumeBuyHeavy;
 
@@ -133,7 +133,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
   let remainingUnits = BigInt(buyAmountUnits);
   let hasTakenPartial = false;
   const startTime = Date.now();
-  const maxHoldTimeMs = 3 * 60 * 1000; // 3 minutes
+  const maxHoldTimeMs = 2 * 60 * 1000; // Max 2 minutes
 
   const checkInterval = setInterval(async () => {
     try {
@@ -143,7 +143,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
       }
 
       const quoteRes = await safeFetch(
-        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${remainingUnits.toString()}&slippageBps=400`
+        `https://api.jup.ag/swap/v1/quote?inputMint=${tokenMint}&outputMint=${SOL_MINT}&amount=${remainingUnits.toString()}&slippageBps=500`
       );
       const quote = await quoteRes.json();
       if (!quote?.outAmount) return;
@@ -155,27 +155,28 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
       const color = pnlPct >= 0 ? '\x1b[32m' : '\x1b[31m';
       console.log(`${color}📈 ${currentValueSol.toFixed(4)} SOL | Peak ${peakValue.toFixed(4)} | ${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%\x1b[0m`);
 
-      // Partial take-profit at +12%
-      if (!hasTakenPartial && currentValueSol >= initialSolSpent * 1.12) {
-        const sellUnits = (remainingUnits * 50n) / 100n;
+      // Partial take-profit at +8%
+      if (!hasTakenPartial && currentValueSol >= initialSolSpent * 1.08) {
+        const sellUnits = (remainingUnits * 60n) / 100n;
         if (sellUnits > 0n) {
-          console.log(`\x1b[32m💰 PARTIAL 50% @ +12%+\x1b[0m`);
+          console.log(`\x1b[32m💰 PARTIAL 60% @ +8%+\x1b[0m`);
           await executeSwap(tokenMint, SOL_MINT, sellUnits.toString());
           remainingUnits -= sellUnits;
           hasTakenPartial = true;
         }
       }
 
-      const trailActive = peakValue >= initialSolSpent * 1.06;
-      const pullback = trailActive && currentValueSol < peakValue * 0.90;
-      const stopLoss = currentValueSol <= initialSolSpent * 0.95;
+      // Trailing stop: sell when drops 5% from peak
+      const trailActive = peakValue >= initialSolSpent * 1.05;
+      const pullback = trailActive && currentValueSol < peakValue * 0.95; // ← 5% from peak
+      const stopLoss = currentValueSol <= initialSolSpent * 0.96;         // -4% hard stop
       const timedOut = Date.now() - startTime > maxHoldTimeMs;
 
       if (pullback || stopLoss || timedOut) {
         clearInterval(checkInterval);
 
         const reason = pullback
-          ? `\x1b[32m🟢 TRAILING EXIT\x1b[0m`
+          ? `\x1b[32m🟢 TRAILING EXIT (5% from peak)\x1b[0m`
           : stopLoss
             ? `\x1b[31m🚨 STOP-LOSS\x1b[0m`
             : `\x1b[33m⏰ TIMEOUT\x1b[0m`;
@@ -191,7 +192,7 @@ async function monitorAndRideSinglePosition(tokenMint, buyAmountUnits, initialSo
         console.log(`🔄 Ready for next target`);
       }
     } catch (e) {}
-  }, 4000);
+  }, 3500);
 }
 
 async function handleGraduationCandidate(signature) {
@@ -236,13 +237,12 @@ async function handleGraduationCandidate(signature) {
 
     console.log(`🔍 [Curve Check] Progress: ${graduationProgress.toFixed(1)}% | Virtual SOL: ${(virtualSol / 1e9).toFixed(1)}`);
 
-    // Balanced filters for ~70% win rate
-    if (graduationProgress < 87 || virtualSol < 55_000_000_000) {
+    // Momentum filters (avoid already pumped)
+    if (graduationProgress < 25 || graduationProgress > 78 || virtualSol < 12_000_000_000) {
       isTrading = false;
       return;
     }
 
-    // Buy pressure filter
     const pressureOk = await hasStrongBuyPressure(newMint);
     if (!pressureOk) {
       console.log(`❌ Weak buy pressure — skipping`);
@@ -250,7 +250,7 @@ async function handleGraduationCandidate(signature) {
       return;
     }
 
-    console.log(`🎯 Strong buy pressure + near graduation → ENTERING`);
+    console.log(`🎯 Momentum detected → ENTERING`);
 
     const solToAllocate = Math.max(0.005, balanceSol - 0.005);
     const amountLamports = Math.floor(solToAllocate * 1e9);
@@ -270,7 +270,7 @@ async function handleGraduationCandidate(signature) {
       } catch (err) {
         isTrading = false;
       }
-    }, 4000);
+    }, 3500);
 
   } catch (err) {
     isTrading = false;
@@ -278,11 +278,11 @@ async function handleGraduationCandidate(signature) {
 }
 
 function startListener() {
-  console.log("🌊 [Throttled Graduation Engine] Connecting...");
+  console.log("🌊 [Momentum Engine] Connecting...");
   const ws = new WebSocket(WS_URL);
 
   ws.on('open', () => {
-    console.log("🟢 [Connected] Scanning cleanly without rate spikes...");
+    console.log("🟢 [Connected] Scanning for momentum...");
     ws.send(JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
@@ -293,7 +293,6 @@ function startListener() {
       ]
     }));
 
-    // Heartbeat every 60 seconds
     setInterval(() => {
       console.log(`💓 Still scanning... ${new Date().toLocaleTimeString()}`);
     }, 60000);
@@ -303,9 +302,8 @@ function startListener() {
     try {
       if (isTrading) return;
 
-      // Throttle: max 1 candidate every 3 seconds
       const now = Date.now();
-      if (now - lastCheckTimestamp < 3000) return;
+      if (now - lastCheckTimestamp < 2500) return;
       lastCheckTimestamp = now;
 
       const payload = JSON.parse(data.toString());
