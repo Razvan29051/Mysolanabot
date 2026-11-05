@@ -20,20 +20,20 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- TARGET WINDOW ($20K - $100K EARLY-TO-MID MOMENTUM) ---
-const MIN_MARKET_CAP_USD = 20000;  
-const MAX_MARKET_CAP_USD = 100000; 
+// --- LOW-CAP HIGH-MOMENTUM TARGETS ($10K - $60K) ---
+const MIN_MARKET_CAP_USD = 10000;  // Catch them early right out of the initial launch zone
+const MAX_MARKET_CAP_USD = 60000;  
 
-// --- BALANCED VOLUME & GREEN CANDLE THRESHOLDS ---
-const MIN_BUY_VOLUME_SOL = 0.15;   // Lowered to 0.15 SOL so it triggers on faster, early green candles
-const BUY_TO_SELL_RATIO = 1.2;     // Buys just need to outweigh sells (1.2x) instead of a strict 2x
+// --- BUY POWER VELOCITY THRESHOLDS ---
+const MIN_BUY_VOLUME_SOL = 0.10;   // Lower threshold for early caps to catch momentum immediately
+const BUY_TO_SELL_RATIO = 1.5;     // Buy volume must be 1.5x higher than sell volume
 
 // --- RISK MANAGEMENT ---
-const STOP_LOSS_PERCENT = -10;     
-const TAKE_PROFIT_PERCENT = 45;    
+const STOP_LOSS_PERCENT = -12;     // Slightly tighter stop loss for low caps (-12%)
+const TAKE_PROFIT_PERCENT = 50;    // Higher reward target (+50%)
 
 let activePositions = new Map(); 
-let tokenVolumeMap = new Map();  // Tracks live buy vs sell volume per token
+let tokenVolumeMap = new Map();  
 let processedMints = new Set();
 let globalWs = null;
 
@@ -70,8 +70,8 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         mint: mintAddress,
         amount: action === 'sell' ? '100%' : amountSol,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 30,
-        priorityFee: 0.002,
+        slippage: 35, // Slightly higher slippage for fast low-cap entries
+        priorityFee: 0.003,
         pool: 'auto'
       })
     });
@@ -86,14 +86,14 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
     process.stdout.write(`✅ Transaction Executed (${action.toUpperCase()}): ${txid}\n`);
     return txid;
   } catch (err) {
-    process.stdout.write(`❌ Trade Execution Failed (${action.toUpperCase()}) -> ${err.message}\n`);
+    process.stdout.write(`❌ Trade Execution Failed (${action.toUpperCase()}): ${err.message}\n`);
     return null;
   }
 }
 
 // --- LIVE WEBSOCKET ENGINE ---
 function startWebSocketListener() {
-  process.stdout.write('⚡ Connecting to PumpPortal Volume & Green Candle Stream...\n');
+  process.stdout.write('⚡ Connecting to PumpPortal Low-Cap Buy-Power Stream...\n');
   
   const wsUrl = PUMP_API_KEY 
     ? `wss://pumpportal.fun/api/data?api-key=${PUMP_API_KEY}` 
@@ -102,7 +102,7 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Tracking live candle volume flows...\n');
+    process.stdout.write('🟢 Connected! Scanning low-caps for heavy buy power...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -113,7 +113,6 @@ function startWebSocketListener() {
 
       const mintAddress = event.mint;
 
-      // Subscribe to individual trade stream for this token to monitor volume flow
       if (globalWs.readyState === WebSocket.OPEN) {
         globalWs.send(JSON.stringify({ method: "subscribeTokenTrade", keys: [mintAddress] }));
       }
@@ -122,17 +121,16 @@ function startWebSocketListener() {
       const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0);
       const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
 
-      // --- CALCULATE LIVE BUY VS SELL VOLUME ---
-      let volStats = tokenVolumeMap.get(mintAddress) || { buyVolumeSol: 0, sellVolumeSol: 0, buyCount: 0, sellCount: 0 };
+      // --- TRACK LIVE BUY VS SELL VOLUME ---
+      let volStats = tokenVolumeMap.get(mintAddress) || { buyVolumeSol: 0, sellVolumeSol: 0, uniqueBuyers: new Set() };
       
-      const tradeSol = event.solAmount || (event.vSolInBondingCurve ? 0.05 : 0.02);
+      const tradeSol = event.solAmount || (event.vSolInBondingCurve ? 0.04 : 0.02);
 
       if (event.txType === 'buy') {
         volStats.buyVolumeSol += tradeSol;
-        volStats.buyCount += 1;
+        if (event.traderPublicKey) volStats.uniqueBuyers.add(event.traderPublicKey);
       } else if (event.txType === 'sell') {
         volStats.sellVolumeSol += tradeSol;
-        volStats.sellCount += 1;
       }
       tokenVolumeMap.set(mintAddress, volStats);
 
@@ -148,7 +146,7 @@ function startWebSocketListener() {
         const pnlPercent = ((currentMc - pos.entryMc) / pos.entryMc) * 100;
         const dropFromPeak = ((currentMc - pos.highestMc) / pos.highestMc) * 100;
 
-        if (pnlPercent <= STOP_LOSS_PERCENT || (pnlPercent > 10 && dropFromPeak <= -8)) {
+        if (pnlPercent <= STOP_LOSS_PERCENT || (pnlPercent > 10 && dropFromPeak <= -10)) {
           activePositions.delete(mintAddress);
           process.stdout.write(`🔴 STOP-LOSS TRIGGERED: ${mintAddress.slice(0, 6)}... (PnL: ${pnlPercent.toFixed(1)}%)\n`);
           
@@ -177,22 +175,23 @@ function startWebSocketListener() {
         }
       }
 
-      // 2. GREEN CANDLE VOLUME-DRIVEN ENTRY TRIGGER
+      // 2. LOW-CAP BUY-POWER ENTRY TRIGGER
       if (event.txType === 'buy' && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
         if (!processedMints.has(mintAddress)) {
           
-          const isGreenCandleFlow = 
+          // Require active buy volume AND multiple unique buyers to confirm true green pressure
+          const hasStrongBuyPower = 
             volStats.buyVolumeSol >= MIN_BUY_VOLUME_SOL && 
+            volStats.uniqueBuyers.size >= 2 &&
             (volStats.sellVolumeSol === 0 || (volStats.buyVolumeSol / volStats.sellVolumeSol) >= BUY_TO_SELL_RATIO);
 
-          if (!isGreenCandleFlow) {
-            process.stdout.write(`🛡️ WAITING FOR GREEN VOLUME: ${mintAddress.slice(0, 6)}... | Buy Vol: ${volStats.buyVolumeSol.toFixed(2)} SOL | Sell Vol: ${volStats.sellVolumeSol.toFixed(2)} SOL\n`);
-            return;
+          if (!hasStrongBuyPower) {
+            return; // Skip silently until buy power thresholds are met
           }
 
           processedMints.add(mintAddress);
 
-          process.stdout.write(`🚀 GREEN CANDLE VOLUME MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)} | Buy Vol: ${volStats.buyVolumeSol.toFixed(2)} SOL\n`);
+          process.stdout.write(`🚀 LOW-CAP BUY-POWER MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)} | Buy Vol: ${volStats.buyVolumeSol.toFixed(2)} SOL | Buyers: ${volStats.uniqueBuyers.size}\n`);
           const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
           if (buyTx) {
@@ -203,10 +202,11 @@ function startWebSocketListener() {
             });
 
             await sendTelegramAlert(
-              `🚀 <b>Green Candle Volume Entry!</b>\n` +
+              `🚀 <b>Low-Cap Buy-Power Entry!</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
               `MC: <b>$${currentMc.toFixed(0)}</b>\n` +
-              `Buy Volume: <b>${volStats.buyVolumeSol.toFixed(2)} SOL</b>\n` +
+              `Buy Vol: <b>${volStats.buyVolumeSol.toFixed(2)} SOL</b>\n` +
+              `Unique Buyers: <b>${volStats.uniqueBuyers.size}</b>\n` +
               `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
             );
           }
@@ -226,7 +226,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('🚀 <b>Pump.fun Green-Candle Volume Bot Online</b>');
+  await sendTelegramAlert('⚡ <b>Pump.fun Low-Cap Buy-Power Bot Online ($10K-$60K)</b>');
   startWebSocketListener();
 }
 
