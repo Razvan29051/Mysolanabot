@@ -56,7 +56,7 @@ async function sendTelegramAlert(message) {
 // --- LOCAL TRANSACTION EXECUTION ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
-    console.log(`🔄 Requesting momentum trade for ${mintAddress} (${amountSol} SOL, action: ${action})...`);
+    console.log(`🔄 Requesting trade for ${mintAddress} (${amountSol} SOL, action: ${action})...`);
 
     const response = await fetch(`https://pumpportal.fun/api/trade-local`, {
       method: 'POST',
@@ -87,7 +87,7 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
       maxRetries: 3
     });
 
-    console.log(`✅ Transaction submitted successfully: ${txid}`);
+    console.log(`✅ Transaction submitted: ${txid}`);
     return txid;
   } catch (err) {
     console.error(`❌ Local swap execution failed (${action}):`, err.message);
@@ -95,24 +95,23 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   }
 }
 
-// --- REAL-TIME POSITION EVALUATION ---
+// --- REAL-TIME POSITION MONITORING ---
 async function evaluatePositionRealtime(mintAddress, currentMc) {
   const position = activePositions.get(mintAddress);
   if (!position) return;
 
-  if (currentMc > position.peakMc) {
-    position.peakMc = currentMc;
-  }
+  if (currentMc > position.peakMc) position.peakMc = currentMc;
 
   const pnlPercentage = ((currentMc - position.entryMc) / position.entryMc) * 100;
   const dropFromPeak = ((position.peakMc - currentMc) / position.peakMc) * 100;
   const ageMs = Date.now() - position.entryTime;
 
+  // TAKE PROFIT: Hit +22% gain -> Lock in profits
   if (pnlPercentage >= 22 && !position.tookPartialProfit) {
     position.tookPartialProfit = true;
     const sellAmount = Number((TRADE_AMOUNT_SOL * 0.6).toFixed(4));
 
-    console.log(`💰 Target PnL reached (+22%) for ${mintAddress}. Locking in wave profits...`);
+    console.log(`💰 Take-Profit Triggered (+22%) for ${mintAddress}`);
     const tx = await executeLocalPumpSwap(mintAddress, sellAmount, 'sell');
     await sendTelegramAlert(
       `💰 <b>Wave Profit Secured (+22%)</b>\n` +
@@ -122,12 +121,13 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
     );
   }
 
+  // STOP LOSS / TRAILING EXIT
   const hitStopLoss = pnlPercentage <= -10;
   const hitTrailingDrop = position.tookPartialProfit && dropFromPeak >= 10;
   const hitTimeout = ageMs > 240000;
 
   if (hitStopLoss || hitTrailingDrop || hitTimeout) {
-    console.log(`🚪 Closing momentum position for ${mintAddress} (PnL: ${pnlPercentage.toFixed(2)}%). Selling...`);
+    console.log(`🚪 Exit Triggered for ${mintAddress} (PnL: ${pnlPercentage.toFixed(2)}%)`);
     activePositions.delete(mintAddress);
 
     const tx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
@@ -140,87 +140,86 @@ async function evaluatePositionRealtime(mintAddress, currentMc) {
   }
 }
 
-// --- WEBSOCKET MOMENTUM & TRADE LISTENER ---
+// --- WEBSOCKET ENGINE ---
 function startWebSocketListener() {
-  console.log('⚡ Connecting to PumpPortal Momentum Stream...');
+  console.log('⚡ Connecting to PumpPortal Real-Time Engine...');
   
   globalWs = new WebSocket('wss://pumpportal.fun/api/data');
 
   globalWs.on('open', () => {
-    console.log('🟢 Connected. Subscribing to trade stream...');
-    globalWs.send(JSON.stringify({ method: 'subscribeTrade' }));
+    console.log('🟢 Connected. Listening for active token creations and wave movements...');
+    // Subscribe to new token events to capture mints and watch them as they grow
+    globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
   globalWs.on('message', async (data) => {
     try {
       const event = JSON.parse(data.toString());
-      
       if (!event || !event.mint) return;
+
       const mintAddress = event.mint;
 
+      // 1. Evaluate positions if already held
       if (activePositions.has(mintAddress)) {
         const currentMc = event.usd_market_cap || (event.marketCapSol * 200) || 0;
-        if (currentMc > 0) {
-          await evaluatePositionRealtime(mintAddress, currentMc);
-        }
+        if (currentMc > 0) await evaluatePositionRealtime(mintAddress, currentMc);
         return;
       }
 
-      if (event.txType === 'buy' && !processedMints.has(mintAddress)) {
-        const solPriceUsd = 200;
-        const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
+      // 2. Track token creation & incoming buy volume
+      const solPriceUsd = 200;
+      const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
 
-        // Log tokens being scanned in the target range to verify activity
-        if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
-          let stats = tokenMetrics.get(mintAddress);
-          if (!stats) {
-            stats = { buyCount: 0, volumeSol: 0 };
-            tokenMetrics.set(mintAddress, stats);
-          }
+      // Dynamically subscribe to individual token trades as soon as they reach our target zone ($4K+)
+      if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
+        let stats = tokenMetrics.get(mintAddress);
+        if (!stats) {
+          stats = { buyCount: 0, volumeSol: 0 };
+          tokenMetrics.set(mintAddress, stats);
 
-          stats.buyCount += 1;
-          stats.volumeSol += Number(event.solAmount || 0);
+          // Subscribe specifically to live trade updates for this active token
+          globalWs.send(JSON.stringify({
+            method: 'subscribeTokenTrade',
+            keys: [mintAddress]
+          }));
+        }
 
-          console.log(`👀 Evaluating ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL`);
+        stats.buyCount += 1;
+        stats.volumeSol += Number(event.solAmount || 0.2);
 
-          if (stats.buyCount >= 5 && stats.volumeSol >= 1.5) {
-            processedMints.add(mintAddress);
-            tokenMetrics.delete(mintAddress);
+        console.log(`👀 Watching Token: ${mintAddress.slice(0, 6)}... | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL`);
 
-            console.log(`🌊 MOMENTUM WAVE DETECTED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
+        // MOMENTUM TRIGGER: 3+ buys & 1.0+ SOL accumulated volume in target zone
+        if (stats.buyCount >= 3 && stats.volumeSol >= 1.0 && !processedMints.has(mintAddress)) {
+          processedMints.add(mintAddress);
+          tokenMetrics.delete(mintAddress);
 
-            const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
+          console.log(`🌊 MOMENTUM WAVE LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
 
-            if (buyTx) {
-              console.log(`✅ Successfully entered wave for token: ${mintAddress}`);
-              
-              activePositions.set(mintAddress, {
-                entryMc: marketCapUsd,
-                peakMc: marketCapUsd,
-                entryTime: Date.now(),
-                remainingTokens: TRADE_AMOUNT_SOL,
-                tookPartialProfit: false
-              });
+          const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
-              if (globalWs && globalWs.readyState === WebSocket.OPEN) {
-                globalWs.send(JSON.stringify({
-                  method: "subscribeTokenTrade",
-                  keys: [mintAddress]
-                }));
-              }
+          if (buyTx) {
+            console.log(`✅ Wave buy completed for: ${mintAddress}`);
+            
+            activePositions.set(mintAddress, {
+              entryMc: marketCapUsd,
+              peakMc: marketCapUsd,
+              entryTime: Date.now(),
+              remainingTokens: TRADE_AMOUNT_SOL,
+              tookPartialProfit: false
+            });
 
-              await sendTelegramAlert(
-                `🌊 <b>Wave Entry Triggered</b>\n` +
-                `Mint: <code>${mintAddress}</code>\n` +
-                `Entry MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
-                `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-              );
-            }
+            await sendTelegramAlert(
+              `🌊 <b>Wave Entry Triggered</b>\n` +
+              `Mint: <code>${mintAddress}</code>\n` +
+              `Entry MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
+              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+            );
           }
         }
       }
     } catch (err) {
-      console.error('❌ Error processing momentum message:', err.message);
+      console.error('❌ Error in stream parser:', err.message);
     }
   });
 
@@ -234,13 +233,13 @@ function startWebSocketListener() {
   });
 }
 
-// --- BOT INITIALIZATION ---
+// --- INITIALIZATION ---
 async function main() {
   console.log(`🔑 Momentum Rider Active: ${wallet.publicKey.toString()}`);
   await sendTelegramAlert(
     `🚀 <b>Momentum Wave Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Live scanning mode ($4K-$50K MC).`
+    `Status: Dual-Stream Scanner Active ($4K-$50K MC).`
   );
   startWebSocketListener();
 }
