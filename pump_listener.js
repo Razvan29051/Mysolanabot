@@ -21,9 +21,9 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// --- OPTIMIZED STRATEGY TARGETS ($8K - $35K MC Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 4000;
-const MAX_MARKET_CAP_USD = 35000;
+// --- OPTIMIZED STRATEGY TARGETS ($4K - $35K MC Sweet Spot) ---
+const MIN_MARKET_CAP_USD = 4000;  // Filters out raw launch chaos below $4K
+const MAX_MARKET_CAP_USD = 35000; // Captures early growth before graduation wall
 
 let activePositions = new Map();
 let lastCheckTime = 0;
@@ -188,7 +188,6 @@ function startWebSocket() {
       const logs = response.params.result.value.logs || [];
       const signature = response.params.result.value.signature;
 
-      // Listen for any transaction interaction involving pump.fun program
       const txInfo = await connection.getParsedTransaction(signature, { maxSupportedTransactionVersion: 0 });
       if (!txInfo || !txInfo.transaction) return;
 
@@ -204,7 +203,7 @@ function startWebSocket() {
         activePositions.set(mintAddress, true);
 
         await sendTelegramAlert(
-          `🎯 <b>Momentum Target Found ($8K-$35K MC)!</b>\n` +
+          `🎯 <b>Momentum Target Found ($4K-$35K MC)!</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
           `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
         );
@@ -243,7 +242,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Active scan mode ($8K-$35K Market Cap range).`
+    `Status: Active scan mode ($4K-$35K Market Cap range).`
   );
   startWebSocket();
 }
