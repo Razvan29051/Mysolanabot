@@ -51,10 +51,10 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Binary Buffer Handled) ---
+// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Auto Pool & Clean Payload) ---
 async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
-    console.log(`🔄 Requesting local Pump.fun ${action} transaction for ${mintAddress} using your wallet (${amountSol} SOL)...`);
+    console.log(`🔄 Requesting local trade for ${mintAddress} (${amountSol} SOL, action: ${action})...`);
 
     const response = await fetch(`https://pumpportal.fun/api/trade-local`, {
       method: 'POST',
@@ -64,10 +64,10 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
         action: action,
         mint: mintAddress,
         amount: amountSol,
-        denominatedInSol: "true",
+        denominatedInSol: true,
         slippage: 15,
         priorityFee: 0.0005,
-        pool: 'pump'
+        pool: 'auto' // Automatically routes between bonding curve and AMM pools
       })
     });
 
@@ -76,7 +76,6 @@ async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
       throw new Error(`PumpPortal Local API status ${response.status}: ${errText}`);
     }
 
-    // Read the raw binary transaction bytes correctly
     const arrayBuffer = await response.arrayBuffer();
     const transaction = VersionedTransaction.deserialize(new Uint8Array(arrayBuffer));
     transaction.sign([wallet]);
@@ -212,7 +211,7 @@ async function startRpcScanner() {
         }
       }
     } catch (err) {
-      console.error('❌ RPC scan cycle note:', err.message);
+      console.log('❌ RPC scan cycle note:', err.message);
     }
 
     await new Promise(resolve => setTimeout(resolve, 6000));
@@ -225,7 +224,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Local Transaction Mode ($3K-$35K). Using your main wallet.`
+    `Status: Local Transaction Mode ($3K-$35K). Auto-pool routing enabled.`
   );
   startRpcScanner();
 }
