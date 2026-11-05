@@ -24,8 +24,8 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
-// --- WAVE RIDING TARGETS ($10K - $50K Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 10000;
+// --- WAVE RIDING TARGETS ($4K - $50K Sweet Spot) ---
+const MIN_MARKET_CAP_USD = 4000; // Updated minimum market cap threshold
 const MAX_MARKET_CAP_USD = 50000;
 
 let tokenMetrics = new Map();
@@ -172,6 +172,9 @@ function startWebSocketListener() {
         const solPriceUsd = 200;
         const marketCapUsd = event.usd_market_cap || ((event.virtualSolReserves / 1e9) * solPriceUsd * 5) || 0;
 
+        // Hard safety check to ignore anything below $4K
+        if (marketCapUsd < MIN_MARKET_CAP_USD) return;
+
         if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
           let stats = tokenMetrics.get(mintAddress);
           if (!stats) {
@@ -187,7 +190,7 @@ function startWebSocketListener() {
             processedMints.add(mintAddress);
             tokenMetrics.delete(mintAddress);
 
-            console.log(`🌊 MOMENTUM WAVE DETECTED: ${mintAddress} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL - Executing Buy...`);
+            console.log(`🌊 MOMENTUM WAVE DETECTED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} | Buys: ${stats.buyCount} | Vol: ${stats.volumeSol.toFixed(2)} SOL - Executing Buy...`);
 
             const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
@@ -202,7 +205,6 @@ function startWebSocketListener() {
                 tookPartialProfit: false
               });
 
-              // Subscribe to live updates for this specific token
               if (globalWs && globalWs.readyState === WebSocket.OPEN) {
                 globalWs.send(JSON.stringify({
                   method: "subscribeTokenTrade",
@@ -213,7 +215,6 @@ function startWebSocketListener() {
               await sendTelegramAlert(
                 `🌊 <b>Wave Entry Triggered</b>\n` +
                 `Mint: <code>${mintAddress}</code>\n` +
-                `Buys Triggered: ${stats.buyCount}\n` +
                 `Entry MC: <b>$${marketCapUsd.toFixed(0)}</b>\n` +
                 `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
               );
@@ -242,7 +243,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Wave Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Volume breakout mode ($10K-$50K MC).`
+    `Status: Volume breakout mode ($4K-$50K MC).`
   );
   startWebSocketListener();
 }
