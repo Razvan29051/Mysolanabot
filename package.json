@@ -1,7 +1,7 @@
 {
   "name": "mysolanabot",
   "version": "1.0.0",
-  "description": "Solana Momentum Bot",
+  "type": "module",
   "main": "pump_listener.js",
   "scripts": {
     "start": "node pump_listener.js"
