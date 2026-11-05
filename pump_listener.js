@@ -20,13 +20,14 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- STRICT HIGH MOMENTUM TARGETS ($30K - $100K Market Cap) ---
-const MIN_MARKET_CAP_USD = 30000; // Absolute floor — nothing below this will ever be bought
-const MAX_MARKET_CAP_USD = 100000;
+// --- ULTRA MOMENTUM TARGETS ($50K - $85K GRADUATION ZONE) ---
+const MIN_MARKET_CAP_USD = 50000; // Hard minimum market cap floor
+const MAX_MARKET_CAP_USD = 85000; // Upper bound right before Raydium migration
+const MIN_5M_VOLUME_USD = 5000;   // Requires at least $5k 5m volume
 
 // --- AUTOMATED RISK MANAGEMENT ---
-const STOP_LOSS_PERCENT = -12;     // Auto-sell if position drops 12%
-const TAKE_PROFIT_PERCENT = 35;    // Auto-sell if position gains 35%
+const STOP_LOSS_PERCENT = -10;     // Sell if down 10%
+const TAKE_PROFIT_PERCENT = 40;    // Target profit threshold
 
 let activePositions = new Map(); 
 let processedMints = new Set();
@@ -102,7 +103,7 @@ function subscribeToMints(mintArray) {
   }));
 }
 
-// --- FETCH STRICT $30K-$100K TOKENS FROM DEXSCREENER ---
+// --- FETCH HIGH VOLUME GRADUATION CANDIDATES FROM DEXSCREENER ---
 async function fetchTopActiveMints() {
   try {
     const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump');
@@ -110,10 +111,12 @@ async function fetchTopActiveMints() {
     const data = await res.json();
     if (!data.pairs) return;
 
-    const activePairs = data.pairs.filter(
-      p => p.chainId === 'solana' && 
-           p.marketCap >= MIN_MARKET_CAP_USD && 
-           p.marketCap <= MAX_MARKET_CAP_USD
+    // Filter for Solana pump.fun pairs in $50K - $85K market cap with active 5m volume
+    const activePairs = data.pairs.filter(p => 
+      p.chainId === 'solana' && 
+      p.marketCap >= MIN_MARKET_CAP_USD && 
+      p.marketCap <= MAX_MARKET_CAP_USD &&
+      (p.volume?.m5 || 0) >= MIN_5M_VOLUME_USD
     );
 
     const mintsToSub = [];
@@ -121,28 +124,26 @@ async function fetchTopActiveMints() {
       const mintAddress = pair.baseToken.address;
       mintsToSub.push(mintAddress);
 
-      // --- ABSOLUTE SAFETY GUARD ---
-      if (pair.marketCap < MIN_MARKET_CAP_USD) {
-        process.stdout.write(`🛡️ BLOCKED LOW CAP: ${mintAddress} is at $${pair.marketCap} (Below $30K limit).\n`);
-        continue;
-      }
+      if (pair.marketCap < MIN_MARKET_CAP_USD) continue;
 
       if (!processedMints.has(mintAddress)) {
         processedMints.add(mintAddress);
 
-        process.stdout.write(`🚀 HIGH MOMENTUM MATCH: ${mintAddress} (MC: $${pair.marketCap.toFixed(0)}) -> Buying...\n`);
+        process.stdout.write(`🔥 GRADUATION VOLUME MATCH: ${mintAddress} | MC: $${pair.marketCap.toFixed(0)} | 5m Vol: $${pair.volume.m5}\n`);
         const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
         if (buyTx) {
           activePositions.set(mintAddress, {
             entryMc: pair.marketCap,
+            highestMc: pair.marketCap,
             buyTime: Date.now()
           });
 
           await sendTelegramAlert(
-            `🚀 <b>High Momentum Entry!</b>\n` +
+            `🔥 <b>High Volume Graduation Entry!</b>\n` +
             `Mint: <code>${mintAddress}</code>\n` +
-            `Entry MC: <b>$${pair.marketCap.toFixed(0)}</b>\n` +
+            `MC: <b>$${pair.marketCap.toFixed(0)}</b>\n` +
+            `5m Volume: <b>$${pair.volume.m5}</b>\n` +
             `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
           );
         }
@@ -156,7 +157,7 @@ async function fetchTopActiveMints() {
   }
 }
 
-// --- WEBSOCKET ENGINE & LIVE POSITION MONITORING ---
+// --- WEBSOCKET ENGINE & TRAILING STOP MONITORING ---
 function startWebSocketListener() {
   process.stdout.write('⚡ Connecting to PumpPortal Stream Engine...\n');
   
@@ -167,11 +168,11 @@ function startWebSocketListener() {
   globalWs = new WebSocket(wsUrl);
 
   globalWs.on('open', () => {
-    process.stdout.write('🟢 Connected! Subscribing to token streams...\n');
+    process.stdout.write('🟢 Connected! Monitoring high-volume tokens...\n');
     globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
 
     fetchTopActiveMints();
-    setInterval(fetchTopActiveMints, 12000);
+    setInterval(fetchTopActiveMints, 10000);
   });
 
   globalWs.on('message', async (data) => {
@@ -189,19 +190,28 @@ function startWebSocketListener() {
       const solReserves = event.vSolInBondingCurve || (event.virtualSolReserves ? event.virtualSolReserves / 1e9 : 0);
       const currentMc = event.marketCapUsd || event.usd_market_cap || (solReserves > 0 ? solReserves * solPriceUsd * 5 : 0);
 
-      // 1. LIVE POSITION STOP-LOSS / TAKE-PROFIT CHECK
+      // 1. DYNAMIC POSITION CHECK & TRAILING STOP-LOSS
       if (activePositions.has(mintAddress) && currentMc > 0) {
         const pos = activePositions.get(mintAddress);
-        const pnlPercent = ((currentMc - pos.entryMc) / pos.entryMc) * 100;
+        
+        // Update peak market cap reached for trailing protection
+        if (currentMc > pos.highestMc) {
+          pos.highestMc = currentMc;
+          activePositions.set(mintAddress, pos);
+        }
 
-        if (pnlPercent <= STOP_LOSS_PERCENT) {
+        const pnlPercent = ((currentMc - pos.entryMc) / pos.entryMc) * 100;
+        const dropFromPeak = ((currentMc - pos.highestMc) / pos.highestMc) * 100;
+
+        // Trigger Stop-Loss (-10% from entry OR -8% drop from peak after moving up)
+        if (pnlPercent <= STOP_LOSS_PERCENT || (pnlPercent > 10 && dropFromPeak <= -8)) {
           activePositions.delete(mintAddress);
-          process.stdout.write(`🔴 STOP-LOSS TRIGGERED: ${mintAddress.slice(0, 6)}... (${pnlPercent.toFixed(1)}%)\n`);
+          process.stdout.write(`🔴 SELL TRIGGERED: ${mintAddress.slice(0, 6)}... (PnL: ${pnlPercent.toFixed(1)}%)\n`);
           
           const sellTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
           if (sellTx) {
             await sendTelegramAlert(
-              `🔴 <b>Stop-Loss Executed</b>\n` +
+              `🔴 <b>Position Closed</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
               `PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
               `Exit MC: <b>$${currentMc.toFixed(0)}</b>`
@@ -223,29 +233,23 @@ function startWebSocketListener() {
         }
       }
 
-      // 2. LIVE BUY ENTRY TRIGGER WITH HARD FLOOR CHECK
+      // 2. LIVE BUY TRIGGER FOR HIGH-CAP STREAM EVENTS
       if (event.txType === 'buy' && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
-        
-        // --- ABSOLUTE SAFETY GUARD ---
-        if (currentMc < MIN_MARKET_CAP_USD) {
-          process.stdout.write(`🛡️ BLOCKED STREAM TOKEN: Market cap $${currentMc.toFixed(0)} is below $30K floor.\n`);
-          return;
-        }
-
         if (!processedMints.has(mintAddress)) {
           processedMints.add(mintAddress);
 
-          process.stdout.write(`🚀 STREAM BUY MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)}\n`);
+          process.stdout.write(`🚀 STREAM MATCH: ${mintAddress.slice(0, 6)}... | MC: $${currentMc.toFixed(0)}\n`);
           const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
           if (buyTx) {
             activePositions.set(mintAddress, {
               entryMc: currentMc,
+              highestMc: currentMc,
               buyTime: Date.now()
             });
 
             await sendTelegramAlert(
-              `🚀 <b>Stream Entry Bought!</b>\n` +
+              `🚀 <b>High Cap Stream Entry!</b>\n` +
               `Mint: <code>${mintAddress}</code>\n` +
               `MC: <b>$${currentMc.toFixed(0)}</b>\n` +
               `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
@@ -268,7 +272,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('🚀 <b>Pump.fun Strict High-Momentum Bot Online ($30K-$100K)</b>');
+  await sendTelegramAlert('🔥 <b>Pump.fun Ultra-Volume Bot Online ($50K-$85K)</b>');
   startWebSocketListener();
 }
 
