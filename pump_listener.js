@@ -131,16 +131,17 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- API SCANNER LOOP WITH BROWSER HEADERS ---
+// --- FULL BATCH API SCANNER LOOP ---
 async function startScanner() {
-  console.log('⚡ Pump.fun API Scanner Active - Scanning $3K-$35K Range...');
+  console.log('⚡ Pump.fun Full-Batch Scanner Active - Scanning $3K-$35K Range...');
   runScanCycle();
   setInterval(runScanCycle, 4000);
 }
 
 async function runScanCycle() {
   try {
-    const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC', {
+    // Fetch a larger batch of 50 coins to scan a wider active list
+    const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=50&sort=created_timestamp&order=DESC', {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'application/json',
@@ -155,7 +156,7 @@ async function runScanCycle() {
     }
     
     const coins = await res.json();
-    console.log(`🔍 Successfully fetched ${coins.length} coins. Evaluating market caps...`);
+    console.log(`🔍 Fetched batch of ${coins.length} coins. Scanning pool for targets...`);
 
     for (const coin of coins) {
       const mintAddress = coin.mint;
@@ -203,7 +204,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Active Scan Mode ($3K-$35K).`
+    `Status: Full-Batch Scan Mode ($3K-$35K).`
   );
   startScanner();
 }
