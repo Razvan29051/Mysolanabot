@@ -1,14 +1,14 @@
 {
   "name": "mysolanabot",
   "version": "1.0.0",
-  "type": "module",
+  "description": "Solana Momentum Bot",
+  "main": "pump_listener.js",
   "scripts": {
     "start": "node pump_listener.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.95.4",
-    "bs58": "^6.0.0",
-    "dotenv": "^16.4.5",
+    "@solana/web3.js": "^1.95.8",
+    "bs58": "^5.0.0",
     "ws": "^8.18.0"
   }
 }
