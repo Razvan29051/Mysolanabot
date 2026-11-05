@@ -20,15 +20,15 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const TRADE_AMOUNT_SOL = 0.05; // Amount in SOL per buy
 
-// --- HIGH MOMENTUM TARGETS ($30K - $100K Market Cap) ---
-const MIN_MARKET_CAP_USD = 30000; // Filter out low-cap traps
-const MAX_MARKET_CAP_USD = 100000; // Upper limit before bonding curve completion
+// --- STRICT HIGH MOMENTUM TARGETS ($30K - $100K Market Cap) ---
+const MIN_MARKET_CAP_USD = 30000; // Absolute floor — nothing below this will ever be bought
+const MAX_MARKET_CAP_USD = 100000;
 
 // --- AUTOMATED RISK MANAGEMENT ---
 const STOP_LOSS_PERCENT = -12;     // Auto-sell if position drops 12%
 const TAKE_PROFIT_PERCENT = 35;    // Auto-sell if position gains 35%
 
-let activePositions = new Map(); // Map<mintAddress, { entryMc, amountSol }
+let activePositions = new Map(); 
 let processedMints = new Set();
 let trackedMints = new Set();
 let globalWs = null;
@@ -102,7 +102,7 @@ function subscribeToMints(mintArray) {
   }));
 }
 
-// --- FETCH RISING $30K-$100K TOKENS FROM DEXSCREENER ---
+// --- FETCH STRICT $30K-$100K TOKENS FROM DEXSCREENER ---
 async function fetchTopActiveMints() {
   try {
     const res = await fetch('https://api.dexscreener.com/latest/dex/search?q=pump');
@@ -120,6 +120,12 @@ async function fetchTopActiveMints() {
     for (const pair of activePairs) {
       const mintAddress = pair.baseToken.address;
       mintsToSub.push(mintAddress);
+
+      // --- ABSOLUTE SAFETY GUARD ---
+      if (pair.marketCap < MIN_MARKET_CAP_USD) {
+        process.stdout.write(`🛡️ BLOCKED LOW CAP: ${mintAddress} is at $${pair.marketCap} (Below $30K limit).\n`);
+        continue;
+      }
 
       if (!processedMints.has(mintAddress)) {
         processedMints.add(mintAddress);
@@ -217,8 +223,15 @@ function startWebSocketListener() {
         }
       }
 
-      // 2. LIVE BUY ENTRY TRIGGER ($30K - $100K RANGE)
+      // 2. LIVE BUY ENTRY TRIGGER WITH HARD FLOOR CHECK
       if (event.txType === 'buy' && currentMc >= MIN_MARKET_CAP_USD && currentMc <= MAX_MARKET_CAP_USD) {
+        
+        // --- ABSOLUTE SAFETY GUARD ---
+        if (currentMc < MIN_MARKET_CAP_USD) {
+          process.stdout.write(`🛡️ BLOCKED STREAM TOKEN: Market cap $${currentMc.toFixed(0)} is below $30K floor.\n`);
+          return;
+        }
+
         if (!processedMints.has(mintAddress)) {
           processedMints.add(mintAddress);
 
@@ -255,7 +268,7 @@ function startWebSocketListener() {
 
 async function main() {
   process.stdout.write(`🔑 Bot Active: ${wallet.publicKey.toString()}\n`);
-  await sendTelegramAlert('🚀 <b>Pump.fun High-Momentum Bot Online ($30K-$100K)</b>');
+  await sendTelegramAlert('🚀 <b>Pump.fun Strict High-Momentum Bot Online ($30K-$100K)</b>');
   startWebSocketListener();
 }
 
