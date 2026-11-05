@@ -19,7 +19,7 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const TRADE_AMOUNT_SOL = 0.05; // Position size in SOL
 
 // --- STRATEGY TARGETS ($3K - $35K MC Sweet Spot) ---
-const MIN_MARKET_CAP_USD = 3000;  // Lowered to $3K to catch initial entries like $3.37K
+const MIN_MARKET_CAP_USD = 3000;
 const MAX_MARKET_CAP_USD = 35000;
 
 let activePositions = new Map();
@@ -131,57 +131,68 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
   }, 4000);
 }
 
-// --- API SCANNER LOOP WITH STATUS LOGS ---
+// --- API SCANNER LOOP WITH EXPLICIT ERROR REPORTING ---
 async function startScanner() {
   console.log('⚡ Pump.fun API Scanner Active - Scanning $3K-$35K Range...');
   
-  setInterval(async () => {
-    try {
-      const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC');
-      if (!res.ok) return;
-      const coins = await res.json();
+  // Run immediately on start
+  runScanCycle();
 
-      console.log(`🔍 Checked ${coins.length} recent launches. Scanning for $3K-$35K sweet spot...`);
+  // Then repeat every 4 seconds
+  setInterval(runScanCycle, 4000);
+}
 
-      for (const coin of coins) {
-        const mintAddress = coin.mint;
-        if (!mintAddress || processedMints.has(mintAddress) || activePositions.has(mintAddress)) continue;
-
-        const solPriceUsd = 200;
-        const marketCapUsd = coin.usd_market_cap || ((coin.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
-
-        if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
-          processedMints.add(mintAddress);
-          console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
-
-          await sendTelegramAlert(
-            `🎯 <b>Momentum Target Found ($3K-$35K MC)!</b>\n` +
-            `Mint: <code>${mintAddress}</code>\n` +
-            `Market Cap: $${marketCapUsd.toFixed(0)}\n` +
-            `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
-          );
-
-          activePositions.set(mintAddress, true);
-          const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
-
-          if (buyTx) {
-            await sendTelegramAlert(
-              `✅ <b>Position Entered</b>\n` +
-              `Mint: <code>${mintAddress}</code>\n` +
-              `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
-            );
-            monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
-          } else {
-            activePositions.delete(mintAddress);
-          }
-          
-          break; 
-        }
-      }
-    } catch (err) {
-      console.error('Scanner error:', err.message);
+async function runScanCycle() {
+  try {
+    console.log('🔄 Fetching latest pump.fun coins...');
+    const res = await fetch('https://frontend-api.pump.fun/coins?offset=0&limit=20&sort=created_timestamp&order=DESC');
+    
+    if (!res.ok) {
+      console.log(`⚠️ API returned status: ${res.status}`);
+      return;
     }
-  }, 4000);
+    
+    const coins = await res.json();
+    console.log(`🔍 Successfully fetched ${coins.length} coins. Evaluating market caps...`);
+
+    for (const coin of coins) {
+      const mintAddress = coin.mint;
+      if (!mintAddress || processedMints.has(mintAddress) || activePositions.has(mintAddress)) continue;
+
+      const solPriceUsd = 200;
+      const marketCapUsd = coin.usd_market_cap || ((coin.virtual_sol_reserves / 1e9) * solPriceUsd * 5);
+
+      if (marketCapUsd >= MIN_MARKET_CAP_USD && marketCapUsd <= MAX_MARKET_CAP_USD) {
+        processedMints.add(mintAddress);
+        console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)}`);
+
+        await sendTelegramAlert(
+          `🎯 <b>Momentum Target Found ($3K-$35K MC)!</b>\n` +
+          `Mint: <code>${mintAddress}</code>\n` +
+          `Market Cap: $${marketCapUsd.toFixed(0)}\n` +
+          `Sniping entry with ${TRADE_AMOUNT_SOL} SOL...`
+        );
+
+        activePositions.set(mintAddress, true);
+        const buyTx = await executeSwap('So11111111111111111111111111111111111111112', mintAddress, TRADE_AMOUNT_SOL * 1e9);
+
+        if (buyTx) {
+          await sendTelegramAlert(
+            `✅ <b>Position Entered</b>\n` +
+            `Mint: <code>${mintAddress}</code>\n` +
+            `<a href="https://solscan.io/tx/${buyTx}">View Tx on Solscan</a>`
+          );
+          monitorPosition(mintAddress, TRADE_AMOUNT_SOL, 1000000);
+        } else {
+          activePositions.delete(mintAddress);
+        }
+        
+        break; 
+      }
+    }
+  } catch (err) {
+    console.error('❌ Scanner loop error:', err.message);
+  }
 }
 
 // --- BOT INITIALIZATION ---
