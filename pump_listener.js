@@ -4,6 +4,7 @@ import bs58 from 'bs58';
 // --- CONFIGURATION & ENV VARS ---
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || process.env.RPC_URL;
 const RAW_PRIVATE_KEY = process.env.PRIVATE_KEY || process.env.BOT_PRIVATE_KEY;
+const PUMP_PORTAL_API_KEY = process.env.PUMP_PORTAL_API_KEY; // Optional, can be left blank if not required by local route
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
@@ -51,18 +52,20 @@ async function sendTelegramAlert(message) {
   }
 }
 
-// --- NATIVE PUMP.FUN BONDING CURVE EXECUTION ---
-async function executePumpSwap(mintAddress, amountSol, action = 'buy') {
+// --- LOCAL TRANSACTION PUMP.FUN EXECUTION (Uses your existing wallet) ---
+async function executeLocalPumpSwap(mintAddress, amountSol, action = 'buy') {
   try {
-    console.log(`🔄 Requesting Pump.fun ${action} transaction for ${mintAddress} (${amountSol} SOL)...`);
+    console.log(`🔄 Requesting local Pump.fun ${action} transaction for ${mintAddress} using your wallet (${amountSol} SOL)...`);
 
-    const response = await fetch(`https://pumpportal.fun/api/trade`, {
+    // Using /api/trade-local to build the transaction for YOUR public key
+    const response = await fetch(`https://pumpportal.fun/api/trade-local`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        action: action,
-        mint: mintAddress,
-        amount: amountSol,
+        publicKey: wallet.publicKey.toString(), // Passes your active bot wallet public key
+        action: action, // 'buy' or 'sell'
+        mint: mintAddress, // Target token mint
+        amount: amountSol, // SOL amount
         denominatedInSol: 'true',
         slippage: 15,
         priorityFee: 0.0005,
@@ -72,14 +75,15 @@ async function executePumpSwap(mintAddress, amountSol, action = 'buy') {
 
     if (!response.ok) {
       const errText = await response.text();
-      throw new Error(`PumpPortal API status ${response.status}: ${errText}`);
+      throw new Error(`PumpPortal Local API status ${response.status}: ${errText}`);
     }
 
     const data = await response.json();
     if (!data || !data.tx) {
-      throw new Error('No transaction data returned from PumpPortal');
+      throw new Error('No transaction data returned from PumpPortal Local API');
     }
 
+    // Sign the transaction locally with your existing private key
     const txBuf = Buffer.from(data.tx, 'base64');
     const transaction = VersionedTransaction.deserialize(txBuf);
     transaction.sign([wallet]);
@@ -89,10 +93,10 @@ async function executePumpSwap(mintAddress, amountSol, action = 'buy') {
       maxRetries: 3
     });
 
-    console.log(`✅ Transaction submitted successfully: ${txid}`);
+    console.log(`✅ Transaction submitted successfully via local signing: ${txid}`);
     return txid;
   } catch (err) {
-    console.error(`❌ Native swap execution failed (${action}):`, err.message);
+    console.error(`❌ Local swap execution failed (${action}):`, err.message);
     return null;
   }
 }
@@ -119,7 +123,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         remainingTokens -= sellAmount;
 
         console.log(`💰 Target PnL reached (+8%). Selling 60% of position for ${mintAddress}`);
-        const tx = await executePumpSwap(mintAddress, TRADE_AMOUNT_SOL * 0.6, 'sell');
+        const tx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL * 0.6, 'sell');
         await sendTelegramAlert(
           `💰 <b>Partial Profit Secured (+8%)</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
@@ -136,7 +140,7 @@ async function monitorPosition(mintAddress, buyPrice, tokenAmount) {
         clearInterval(interval);
         activePositions.delete(mintAddress);
 
-        const tx = await executePumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
+        const tx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'sell');
         await sendTelegramAlert(
           `🚪 <b>Position Closed</b>\n` +
           `Mint: <code>${mintAddress}</code>\n` +
@@ -192,7 +196,7 @@ async function startRpcScanner() {
 
                 console.log(`💎 MOMENTUM TARGET LOCKED: ${mintAddress} | MC: $${marketCapUsd.toFixed(0)} - Executing Buy...`);
 
-                const buyTx = await executePumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
+                const buyTx = await executeLocalPumpSwap(mintAddress, TRADE_AMOUNT_SOL, 'buy');
 
                 if (buyTx) {
                   console.log(`✅ Successfully bought position for token: ${mintAddress}`);
@@ -228,7 +232,7 @@ async function main() {
   await sendTelegramAlert(
     `🚀 <b>Momentum Rider Bot Online</b>\n` +
     `Wallet: <code>${wallet.publicKey.toString()}</code>\n` +
-    `Status: Native Pump.fun Bonding Curve Mode ($3K-$35K).`
+    `Status: Local Transaction Mode ($3K-$35K). Using your main wallet.`
   );
   startRpcScanner();
 }
