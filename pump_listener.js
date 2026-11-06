@@ -18,20 +18,22 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const SOL_RESERVE = 0.04;
+// Leave more SOL for fees
+const SOL_RESERVE = 0.06;
 
-// ========== FILTERS (balanced for real momentum) ==========
+// ========== FILTERS ==========
 const MIN_MARKET_CAP_USD = 30000;
 const MAX_MARKET_CAP_USD = 220000;
-const MIN_AGE_SECONDS = 180;                // 3 minutes
-const MIN_SOL_INFLOW = 2.8;                 // Real SOL bought
+const MIN_AGE_SECONDS = 180;
+const MIN_SOL_INFLOW = 2.8;
 const MIN_BUY_TRADES = 12;
-const MIN_BUY_RATIO = 0.68;                 // Slightly relaxed
+const MIN_BUY_RATIO = 0.68;
 const MIN_MC_GROWTH = 1.35;
-
-const RECENT_WINDOW_MS = 45_000;
 const MIN_RECENT_BUYS = 5;
 
+const RECENT_WINDOW_MS = 45_000;
+
+// ========== EXIT RULES ==========
 const HARD_STOP_LOSS = -8.0;
 const TRAILING_ACTIVATION = 15.0;
 const TRAILING_DROP_EARLY = -7.0;
@@ -95,10 +97,12 @@ async function getSpendableSol() {
   return Math.max(0, Number((sol - SOL_RESERVE).toFixed(4)));
 }
 
-// ====================== TRADE EXECUTION ======================
+// ====================== TRADE EXECUTION (FIXED) ======================
 async function executeSwap(mint, amountSol, action = 'buy') {
   try {
-    log(`🔄 ${action.toUpperCase()} ${mint.slice(0, 8)}... | ${amountSol} SOL`);
+    const finalAmount = action === 'buy' ? Math.max(0.01, amountSol * 0.97) : amountSol;
+
+    log(`🔄 ${action.toUpperCase()} ${mint.slice(0, 8)}... | ${finalAmount.toFixed(4)} SOL`);
 
     const response = await fetch('https://pumpportal.fun/api/trade-local', {
       method: 'POST',
@@ -107,28 +111,52 @@ async function executeSwap(mint, amountSol, action = 'buy') {
         publicKey: wallet.publicKey.toString(),
         action,
         mint,
-        amount: action === 'sell' ? '100%' : amountSol,
+        amount: action === 'sell' ? '100%' : finalAmount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 26,
-        priorityFee: 0.003,
+        slippage: 50,
+        priorityFee: 0.008,
         pool: 'auto'
       })
     });
 
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`API: ${errText}`);
+    }
 
     const tx = VersionedTransaction.deserialize(new Uint8Array(await response.arrayBuffer()));
     tx.sign([wallet]);
 
     const txid = await connection.sendTransaction(tx, {
       skipPreflight: true,
-      maxRetries: 4
+      maxRetries: 5
     });
 
-    log(`✅ ${action.toUpperCase()} sent: ${txid}`);
+    log(`📤 Transaction sent: ${txid}`);
+
+    const latest = await connection.getLatestBlockhash('confirmed');
+    const conf = await connection.confirmTransaction({
+      signature: txid,
+      blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight
+    }, 'confirmed');
+
+    if (conf.value.err) {
+      throw new Error(`On-chain fail: ${JSON.stringify(conf.value.err)}`);
+    }
+
+    log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
     return txid;
+
   } catch (err) {
-    log(`❌ ${action.toUpperCase()} failed: ${err.message}`);
+    log(`❌ ${action.toUpperCase()} FAILED: ${err.message}`);
+
+    await sendTelegram(
+      `❌ <b>${action.toUpperCase()} FAILED</b>\n` +
+      `Mint: <code>${mint}</code>\n` +
+      `Error: <code>${err.message.slice(0, 200)}</code>`
+    );
+
     return null;
   }
 }
@@ -171,7 +199,7 @@ function parseEvent(event) {
   };
 }
 
-// ====================== HELPERS ======================
+// ====================== STRUCTURE & PRESSURE ======================
 function updateStructure(tracker, mcUsd) {
   const now = Date.now();
   tracker.mcHistory.push({ mc: mcUsd, time: now });
@@ -193,9 +221,7 @@ function getRecentBuyPressure(tracker) {
   const now = Date.now();
   const recent = tracker.tradeLog.filter(t => now - t.time <= RECENT_WINDOW_MS);
   const recentBuys = recent.filter(t => t.isBuy).length;
-  const recentSol = recent.filter(t => t.isBuy).reduce((sum, t) => sum + t.sol, 0);
-
-  return { recentBuys, recentSol };
+  return { recentBuys };
 }
 
 // ====================== SUBSCRIBE / CLEANUP ======================
@@ -232,7 +258,7 @@ function startWebSocket() {
   if (PUMPPORTAL_API_KEY) {
     log('🔑 Using PUMPPORTAL_API_KEY');
   } else {
-    log('⚠️ No API key – data may be limited');
+    log('⚠️ No API key set');
   }
 
   globalWs = new WebSocket(url);
@@ -253,7 +279,7 @@ function startWebSocket() {
       const { mint, solReserves, mcUsd, isBuy, isSell, solAmount, isNewToken, isTrade } = data;
       const now = Date.now();
 
-      // ---------- POSITION MANAGEMENT ----------
+      // ---------- MANAGE OPEN POSITION ----------
       if (activePositions.has(mint) && mcUsd > 0) {
         const pos = activePositions.get(mint);
 
@@ -305,7 +331,7 @@ function startWebSocket() {
           lastMc: mcUsd,
           buyCount: 0,
           sellCount: 0,
-          totalBuySol: 0,                // ← real inflow tracker
+          totalBuySol: 0,
           createdAt: now,
           tradeLog: [],
           mcHistory: [{ mc: mcUsd, time: now }],
@@ -320,17 +346,15 @@ function startWebSocket() {
       if (tokenTrackers.has(mint) && !processedMints.has(mint) && isTrade) {
         const t = tokenTrackers.get(mint);
 
-        // Record trade
         t.tradeLog.push({ time: now, isBuy, sol: solAmount });
         t.tradeLog = t.tradeLog.filter(tr => now - tr.time < 6 * 60 * 1000);
 
-        // Update reserves & real inflow
         t.peakSol = Math.max(t.peakSol, solReserves);
         if (mcUsd > 0) t.lastMc = mcUsd;
 
         if (isBuy) {
           t.buyCount++;
-          t.totalBuySol += solAmount;          // ← important
+          t.totalBuySol += solAmount;
           t.biggestBuy = Math.max(t.biggestBuy, solAmount);
         }
         if (isSell) t.sellCount++;
@@ -338,22 +362,18 @@ function startWebSocket() {
         updateStructure(t, t.lastMc);
 
         const ageSec = (now - t.createdAt) / 1000;
-        const solInflow = t.totalBuySol;                 // real SOL bought while watching
-        const reserveGain = t.peakSol - t.startSol;
-        const effectiveVelocity = Math.max(solInflow, reserveGain);
-
+        const effectiveVelocity = Math.max(t.totalBuySol, t.peakSol - t.startSol);
         const totalTrades = t.buyCount + t.sellCount;
         const buyRatio = totalTrades > 0 ? t.buyCount / totalTrades : 0;
         const mcGrowth = t.firstMc > 0 ? t.lastMc / t.firstMc : 0;
         const pressure = getRecentBuyPressure(t);
         const goodStructure = hasHigherHighsHigherLows(t);
 
-        // Progress log
         if (t.buyCount > 0 && t.buyCount % 5 === 0) {
           log(`📈 ${mint.slice(0, 8)} | Age ${ageSec.toFixed(0)}s | MC $${Math.round(t.lastMc)} | Inflow +${effectiveVelocity.toFixed(2)} SOL | Buys ${t.buyCount}/${totalTrades} (${(buyRatio*100).toFixed(0)}%) | Recent ${pressure.recentBuys} | Struct ${goodStructure}`);
         }
 
-        // ========== ENTRY DECISION ==========
+        // ========== ENTRY ==========
         const pass =
           ageSec >= MIN_AGE_SECONDS &&
           t.lastMc >= MIN_MARKET_CAP_USD &&
@@ -373,17 +393,16 @@ function startWebSocket() {
           tokenTrackers.delete(mint);
 
           const spendable = await getSpendableSol();
-          if (spendable < 0.07) {
+          if (spendable < 0.08) {
             log(`⚠️ Low balance: ${spendable} SOL`);
             unsubscribe(mint);
             return;
           }
 
           isBuying = true;
-          log(`🚀 STRONG MOMENTUM → Buying ${spendable} SOL`);
+          log(`🚀 STRONG MOMENTUM → Buying ${spendable.toFixed(4)} SOL`);
           log(`   ${mint}`);
           log(`   MC: $${t.lastMc.toFixed(0)} | Inflow: +${effectiveVelocity.toFixed(2)} SOL | Age: ${ageSec.toFixed(0)}s`);
-          log(`   Buys: ${t.buyCount}/${totalTrades} (${(buyRatio*100).toFixed(0)}%) | Recent: ${pressure.recentBuys}`);
 
           const tx = await executeSwap(mint, spendable, 'buy');
           isBuying = false;
@@ -400,7 +419,7 @@ function startWebSocket() {
             await sendTelegram(
               `🚀 <b>STRONG MOMENTUM ENTRY</b>\n` +
               `Mint: <code>${mint}</code>\n` +
-              `Spent: <b>${spendable} SOL</b>\n` +
+              `Spent: <b>${(spendable * 0.97).toFixed(4)} SOL</b>\n` +
               `MC: $${t.lastMc.toFixed(0)}\n` +
               `Inflow: +${effectiveVelocity.toFixed(2)} SOL\n` +
               `Age: ${ageSec.toFixed(0)}s | Buys: ${t.buyCount}\n` +
@@ -437,7 +456,7 @@ async function main() {
     log(`💓 Status | Msgs: ${messageCount} | Watching: ${tokenTrackers.size} | Positions: ${activePositions.size}`);
   }, 3 * 60 * 1000);
 
-  await sendTelegram(`⚡ <b>Bot updated</b> – fixed velocity tracking`);
+  await sendTelegram(`⚡ <b>Bot fully updated</b>\nHigh slippage + better landing\nWaiting for strong momentum...`);
 
   startWebSocket();
 }
