@@ -21,22 +21,20 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const SOL_RESERVE = 0.05;
 const MAX_BUY_SOL = 0.25;
 
-// ========== AGGRESSIVE ENTRY (for green candles) ==========
-const MIN_MARKET_CAP_USD = 10000;
-const MAX_MARKET_CAP_USD = 500000;
-const MIN_RECENT_BUYS = 5;
-const MIN_BUY_RATIO = 0.58;
-const RECENT_WINDOW_MS = 35_000;
+// ========== VERY AGGRESSIVE FOR TESTING ==========
+const MIN_MARKET_CAP_USD = 8000;
+const MAX_MARKET_CAP_USD = 600000;
+const MIN_RECENT_BUYS = 3;
+const MIN_BUY_RATIO = 0.52;
+const RECENT_WINDOW_MS = 45_000;
 
-// ========== QUICK PROFIT EXIT ==========
-const HARD_STOP_LOSS = -6.5;
-const TRAILING_ACTIVATION = 9.0;
-const TRAILING_DROP = -4.5;
-const TAKE_PROFIT = 32.0;          // Take profit faster
-const MAX_HOLD_MS = 9 * 60 * 1000; // Max 9 minutes
+// ========== QUICK PROFIT ==========
+const HARD_STOP_LOSS = -6.0;
+const TRAILING_ACTIVATION = 8.0;
+const TRAILING_DROP = -4.0;
+const TAKE_PROFIT = 28.0;
+const MAX_HOLD_MS = 8 * 60 * 1000;
 const NO_UPDATE_FORCE_SELL_MS = 11_000;
-const LOSS_COOLDOWN_MS = 5 * 60 * 1000;
-const TRACKER_TTL_MS = 12 * 60 * 1000;
 
 // ========== STATE ==========
 let activePositions = new Map();
@@ -47,6 +45,7 @@ let globalWs = null;
 let solPriceUsd = 180;
 let isBuying = false;
 let lastLossTime = 0;
+let tradeEventsReceived = 0;
 
 // ====================== HELPERS ======================
 async function sendTelegram(message) {
@@ -62,9 +61,7 @@ async function sendTelegram(message) {
         disable_web_page_preview: true
       })
     });
-  } catch (e) {
-    log(`❌ Telegram: ${e.message}`);
-  }
+  } catch (e) {}
 }
 
 function log(msg) {
@@ -111,49 +108,25 @@ async function executeSwap(mint, amountSol, action = 'buy') {
     tx.sign([wallet]);
 
     const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 4 });
-
-    const latest = await connection.getLatestBlockhash('confirmed');
-    const conf = await connection.confirmTransaction({
-      signature: txid,
-      blockhash: latest.blockhash,
-      lastValidBlockHeight: latest.lastValidBlockHeight
-    }, 'confirmed');
-
-    if (conf.value.err) throw new Error(JSON.stringify(conf.value.err));
-
-    log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
+    log(`✅ ${action.toUpperCase()} sent: ${txid}`);
     return txid;
   } catch (err) {
-    log(`❌ ${action.toUpperCase()} FAILED: ${err.message}`);
-    if (action === 'buy') {
-      await sendTelegram(`❌ Buy failed\nMint: <code>${mint}</code>\n${err.message.slice(0, 120)}`);
-    }
+    log(`❌ ${action.toUpperCase()} failed: ${err.message}`);
     return null;
   }
 }
 
-// ====================== TRENDING DISCOVERY ======================
+// ====================== TRENDING ======================
 async function fetchTrendingTokens() {
   try {
-    // Method 1: Boosted tokens
-    const res1 = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
-    const data1 = await res1.json();
-
-    // Method 2: Latest token profiles (sometimes better)
-    const res2 = await fetch('https://api.dexscreener.com/token-profiles/latest/v1');
-    const data2 = await res2.json();
-
-    const all = [];
-    if (Array.isArray(data1)) all.push(...data1);
-    if (Array.isArray(data2)) all.push(...data2);
+    const res = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
+    const data = await res.json();
+    if (!Array.isArray(data)) return;
 
     let added = 0;
-
-    for (const item of all) {
-      const chain = item.chainId || item.chain;
-      if (chain !== 'solana') continue;
-
-      const mint = item.tokenAddress || item.address;
+    for (const item of data) {
+      if (item.chainId !== 'solana') continue;
+      const mint = item.tokenAddress;
       if (!mint || subscribedMints.has(mint) || processedMints.has(mint)) continue;
 
       subscribedMints.add(mint);
@@ -163,18 +136,15 @@ async function fetchTrendingTokens() {
         sellCount: 0,
         totalBuySol: 0,
         createdAt: Date.now(),
-        tradeLog: [],
-        mcHistory: []
+        tradeLog: []
       });
-
       subscribe(mint);
       added++;
       log(`🔥 TRENDING → ${mint.slice(0, 8)}...`);
     }
-
     if (added > 0) log(`✅ Added ${added} trending tokens`);
   } catch (err) {
-    log(`⚠️ Trending fetch error: ${err.message}`);
+    log(`⚠️ DexScreener error: ${err.message}`);
   }
 }
 
@@ -194,19 +164,7 @@ function parseEvent(event) {
   let solAmount = event.solAmount || 0;
   if (solAmount > 1e6) solAmount /= 1e9;
 
-  return {
-    mint: event.mint,
-    mcUsd,
-    isBuy,
-    isSell,
-    solAmount,
-    isTrade: isBuy || isSell
-  };
-}
-
-function getRecentBuys(tracker) {
-  const now = Date.now();
-  return tracker.tradeLog.filter(t => t.isBuy && now - t.time <= RECENT_WINDOW_MS).length;
+  return { mint: event.mint, mcUsd, isBuy, isSell, solAmount, isTrade: isBuy || isSell };
 }
 
 function subscribe(mint) {
@@ -229,9 +187,7 @@ function startWebSocket() {
 
   globalWs = new WebSocket(url);
 
-  globalWs.on('open', () => {
-    log('🟢 Connected – Only Trending + Quick Profit Mode');
-  });
+  globalWs.on('open', () => log('🟢 Connected – Debug + Aggressive Mode'));
 
   globalWs.on('message', async (raw) => {
     try {
@@ -242,57 +198,51 @@ function startWebSocket() {
       const { mint, mcUsd, isBuy, isSell, solAmount, isTrade } = data;
       const now = Date.now();
 
-      // ===== EXIT LOGIC =====
+      // EXIT
       if (activePositions.has(mint) && mcUsd > 0) {
         const pos = activePositions.get(mint);
         pos.lastUpdate = now;
         if (mcUsd > pos.highestMc) pos.highestMc = mcUsd;
 
         const pnl = ((mcUsd - pos.entryMc) / pos.entryMc) * 100;
-        const dropFromPeak = ((mcUsd - pos.highestMc) / pos.highestMc) * 100;
+        const drop = ((mcUsd - pos.highestMc) / pos.highestMc) * 100;
 
         let reason = null;
-        if (pnl <= HARD_STOP_LOSS) reason = `Stop-Loss ${pnl.toFixed(1)}%`;
-        else if (pnl >= TAKE_PROFIT) reason = `Quick TP +${pnl.toFixed(1)}%`;
-        else if (pnl >= TRAILING_ACTIVATION && dropFromPeak <= TRAILING_DROP) reason = `Trailing ${dropFromPeak.toFixed(1)}%`;
+        if (pnl <= HARD_STOP_LOSS) reason = `SL ${pnl.toFixed(1)}%`;
+        else if (pnl >= TAKE_PROFIT) reason = `TP +${pnl.toFixed(1)}%`;
+        else if (pnl >= TRAILING_ACTIVATION && drop <= TRAILING_DROP) reason = `Trail ${drop.toFixed(1)}%`;
         else if (now - pos.buyTime > MAX_HOLD_MS) reason = `Max hold`;
 
         if (reason) {
           activePositions.delete(mint);
           unsubscribe(mint);
-          log(`🔴 EXIT ${mint.slice(0, 8)} | ${reason}`);
-
-          const tx = await executeSwap(mint, 0, 'sell');
-          if (tx) {
-            await sendTelegram(`🔴 <b>Closed</b>\nMint: <code>${mint}</code>\n${reason}\nPnL: <b>${pnl.toFixed(1)}%</b>\n<a href="https://solscan.io/tx/${tx}">Tx</a>`);
-          }
+          log(`🔴 EXIT ${mint.slice(0,8)} | ${reason}`);
+          await executeSwap(mint, 0, 'sell');
         }
         return;
       }
 
-      // ===== ENTRY LOGIC =====
+      // ENTRY TRACKING
       if (!tokenTrackers.has(mint) || processedMints.has(mint) || !isTrade) return;
 
+      tradeEventsReceived++;
       const t = tokenTrackers.get(mint);
-      t.tradeLog.push({ time: now, isBuy, sol: solAmount });
+
+      t.tradeLog.push({ time: now, isBuy });
       t.tradeLog = t.tradeLog.filter(x => now - x.time < 5 * 60 * 1000);
 
       if (mcUsd > 0) t.lastMc = mcUsd;
-      if (isBuy) {
-        t.buyCount++;
-        t.totalBuySol += solAmount;
-      }
+      if (isBuy) t.buyCount++;
       if (isSell) t.sellCount++;
 
-      const recentBuys = getRecentBuys(t);
+      const recentBuys = t.tradeLog.filter(x => x.isBuy && now - x.time <= RECENT_WINDOW_MS).length;
       const total = t.buyCount + t.sellCount;
       const ratio = total > 0 ? t.buyCount / total : 0;
 
-      if (t.buyCount % 3 === 0 && t.buyCount > 0) {
-        log(`📈 ${mint.slice(0, 8)} | MC $${Math.round(t.lastMc)} | Recent buys: ${recentBuys} | Ratio ${(ratio*100).toFixed(0)}%`);
-      }
+      // Log every trade for debugging
+      log(`📊 TRADE ${mint.slice(0,6)} | ${isBuy ? 'BUY' : 'SELL'} | MC $${Math.round(t.lastMc)} | RecentBuys ${recentBuys} | Total ${t.buyCount}/${total}`);
 
-      // Fast entry on strong recent buying
+      // Very aggressive entry
       if (
         t.lastMc >= MIN_MARKET_CAP_USD &&
         t.lastMc <= MAX_MARKET_CAP_USD &&
@@ -300,7 +250,7 @@ function startWebSocket() {
         ratio >= MIN_BUY_RATIO &&
         !isBuying &&
         activePositions.size === 0 &&
-        (now - lastLossTime > LOSS_COOLDOWN_MS)
+        (now - lastLossTime > 300000)
       ) {
         processedMints.add(mint);
         tokenTrackers.delete(mint);
@@ -309,7 +259,7 @@ function startWebSocket() {
         if (buyAmount < 0.05) return;
 
         isBuying = true;
-        log(`🚀 GREEN CANDLE → Buying ${buyAmount} SOL`);
+        log(`🚀 BUYING ${buyAmount} SOL of ${mint.slice(0,8)}`);
 
         const tx = await executeSwap(mint, buyAmount, 'buy');
         isBuying = false;
@@ -322,15 +272,7 @@ function startWebSocket() {
             lastUpdate: now
           });
           subscribe(mint);
-
-          await sendTelegram(
-            `🚀 <b>GREEN CANDLE ENTRY</b>\n` +
-            `Mint: <code>${mint}</code>\n` +
-            `Spent: <b>${buyAmount} SOL</b>\n` +
-            `MC: $${t.lastMc.toFixed(0)}\n` +
-            `Recent buys: ${recentBuys}\n` +
-            `<a href="https://solscan.io/tx/${tx}">Tx</a>`
-          );
+          await sendTelegram(`🚀 <b>ENTRY</b>\nMint: <code>${mint}</code>\nSpent: ${buyAmount} SOL\nMC: $${t.lastMc.toFixed(0)}`);
         }
       }
     } catch (err) {
@@ -338,36 +280,23 @@ function startWebSocket() {
     }
   });
 
-  globalWs.on('close', () => setTimeout(startWebSocket, 5000));
-  globalWs.on('error', (e) => log(`WS Error: ${e.message}`));
+  globalWs.on('close', () => setTimeout(startWebSocket, 4000));
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`🔑 Wallet: ${wallet.publicKey.toString()}`);
-  log(`💰 Max buy: ${MAX_BUY_SOL} SOL | Quick TP: ${TAKE_PROFIT}%`);
-
   await updateSolPrice();
-  setInterval(updateSolPrice, 5 * 60 * 1000);
+  setInterval(updateSolPrice, 300000);
 
-  // Fetch trending every 35 seconds
   await fetchTrendingTokens();
-  setInterval(fetchTrendingTokens, 35_000);
+  setInterval(fetchTrendingTokens, 40000);
 
   setInterval(() => {
-    // Force sell stale positions
-    const now = Date.now();
-    for (const [mint, pos] of activePositions) {
-      if (now - pos.lastUpdate > NO_UPDATE_FORCE_SELL_MS) {
-        log(`⚠️ Force sell ${mint.slice(0,8)}`);
-        activePositions.delete(mint);
-        executeSwap(mint, 0, 'sell');
-      }
-    }
-  }, 4000);
+    log(`💓 Status | Watching: ${tokenTrackers.size} | Trades received: ${tradeEventsReceived} | Open: ${activePositions.size}`);
+  }, 60000);
 
-  await sendTelegram(`⚡ <b>Quick Profit Mode</b>\nOnly trending + fast TP at +${TAKE_PROFIT}%`);
-
+  await sendTelegram(`⚡ Debug Mode ON – logging every trade`);
   startWebSocket();
 }
 
