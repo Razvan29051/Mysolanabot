@@ -20,11 +20,14 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 const MAX_BUY_SOL = 0.20;
 const SOL_RESERVE = 0.04;
+const MAX_TRACKING = 8;               // Important: only track 8 tokens at a time
 
-// Settings
-const MIN_MC = 8000;
-const MIN_BUYS = 5;
+// Entry settings
+const MIN_MC = 7500;
+const MIN_BUYS = 4;
 const MIN_RECENT_BUYS = 3;
+
+// Exit settings
 const STOP_LOSS = -6;
 const TAKE_PROFIT = 26;
 
@@ -56,7 +59,7 @@ async function sendTelegram(msg) {
         disable_web_page_preview: true
       })
     });
-  } catch (e) {}
+  } catch {}
 }
 
 async function getBalance() {
@@ -142,22 +145,29 @@ function startWebSocket() {
           activePositions.delete(mint);
           log(`🔴 EXIT ${mint.slice(0, 8)} | PnL ${pnl.toFixed(1)}%`);
           await swap(mint, 0, 'sell');
-          await sendTelegram(`Closed <code>${mint.slice(0, 8)}</code> | PnL ${pnl.toFixed(1)}%`);
+          await sendTelegram(`Closed <code>${mint.slice(0, 8)}</code>\nPnL: <b>${pnl.toFixed(1)}%</b>`);
         }
         return;
       }
 
       // ========== NEW TOKEN ==========
       if (isNew && !trackers.has(mint) && !processed.has(mint)) {
+        // Only accept if we have room
+        if (trackers.size >= MAX_TRACKING) {
+          return;
+        }
+
         trackers.set(mint, {
           buys: 0,
           sells: 0,
           recent: [],
           mc: mc,
-          start: Date.now()
+          start: Date.now(),
+          lastTrade: Date.now()
         });
+
         ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
-        log(`👀 WATCH ${mint.slice(0, 8)} | MC $${Math.round(mc)}`);
+        log(`👀 WATCH ${mint.slice(0, 8)} | MC $${Math.round(mc)} | Tracking: ${trackers.size}/${MAX_TRACKING}`);
         return;
       }
 
@@ -166,6 +176,7 @@ function startWebSocket() {
         tradesReceived++;
         const t = trackers.get(mint);
 
+        t.lastTrade = Date.now();
         if (isBuy) t.buys++;
         if (isSell) t.sells++;
         if (mc > 0) t.mc = mc;
@@ -183,7 +194,7 @@ function startWebSocket() {
           t.mc >= MIN_MC &&
           t.buys >= MIN_BUYS &&
           recentBuys >= MIN_RECENT_BUYS &&
-          age > 12 &&
+          age > 10 &&
           activePositions.size === 0 &&
           !isBuying
         ) {
@@ -215,16 +226,29 @@ function startWebSocket() {
     setTimeout(startWebSocket, 4000);
   });
 
-  ws.on('error', (err) => {
-    log(`WS Error: ${err.message}`);
-  });
+  ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
-// ====================== MAIN ======================
+// ====================== CLEANUP + MAIN ======================
+function cleanup() {
+  const now = Date.now();
+  for (const [mint, t] of trackers) {
+    // Remove tokens with no trades for 45 seconds
+    if (now - t.lastTrade > 45000 && t.buys === 0) {
+      trackers.delete(mint);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ method: 'unsubscribeTokenTrade', keys: [mint] }));
+      }
+      log(`🗑️ Removed inactive ${mint.slice(0, 8)}`);
+    }
+  }
+}
+
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   log(`RPC: ${RPC_ENDPOINT.slice(0, 55)}...`);
-  log(`PumpPortal API Key: ${PUMPPORTAL_API_KEY ? 'Loaded' : 'MISSING'}`);
+  log(`API Key: ${PUMPPORTAL_API_KEY ? 'Loaded' : 'MISSING'}`);
+  log(`Max tracking: ${MAX_TRACKING} tokens`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -232,11 +256,12 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
+  setInterval(cleanup, 15000);
   setInterval(() => {
-    log(`Status | Watching: ${trackers.size} | Trades: ${tradesReceived} | Positions: ${activePositions.size}`);
+    log(`Status | Watching: ${trackers.size}/${MAX_TRACKING} | Trades: ${tradesReceived} | Positions: ${activePositions.size}`);
   }, 30000);
 
-  await sendTelegram('Bot started (full clean version)');
+  await sendTelegram('Bot started – Limited tracking (max 8)');
   startWebSocket();
 }
 
