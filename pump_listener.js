@@ -18,37 +18,32 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const SOL_RESERVE = 0.05;
-const MAX_BUY_SOL = 0.25;
+const MAX_BUY_SOL = 0.20;
+const SOL_RESERVE = 0.04;
 
-// ========== AGGRESSIVE MOMENTUM FILTERS ==========
-const MIN_MARKET_CAP_USD = 9000;
-const MAX_MARKET_CAP_USD = 180000;
-const MIN_AGE_SECONDS = 25;
-const MIN_SOL_INFLOW = 1.2;
-const MIN_BUY_TRADES = 6;
-const MIN_BUY_RATIO = 0.59;
-const MIN_RECENT_BUYS = 4;
-const RECENT_WINDOW_MS = 30_000;
+// Very low barriers so it can trade
+const MIN_MC = 6000;
+const MIN_BUYS = 4;
+const MIN_RECENT_BUYS = 3;
 
-// ========== QUICK PROFIT EXITS ==========
-const HARD_STOP_LOSS = -6.5;
-const TRAILING_ACTIVATION = 9.0;
-const TRAILING_DROP = -4.2;
-const TAKE_PROFIT = 29.0;
-const MAX_HOLD_MS = 8 * 60 * 1000;
-const NO_UPDATE_MS = 10_000;
+// Quick exits
+const STOP_LOSS = -6;
+const TAKE_PROFIT = 25;
 
-// ========== STATE ==========
+// State
 let activePositions = new Map();
-let tokenTrackers = new Map();
-let processedMints = new Set();
-let globalWs = null;
-let solPriceUsd = 180;
-let isBuying = false;
-let lastLossTime = 0;
+let trackers = new Map();
+let processed = new Set();
+let ws = null;
+let solPrice = 180;
+let tradesReceived = 0;
 
 // ====================== HELPERS ======================
+function log(msg) {
+  const t = new Date().toISOString().substr(11, 8);
+  console.log(`[${t}] ${msg}`);
+}
+
 async function sendTelegram(msg) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
   try {
@@ -58,35 +53,21 @@ async function sendTelegram(msg) {
       body: JSON.stringify({
         chat_id: TELEGRAM_CHAT_ID,
         text: msg,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true
+        parse_mode: 'HTML'
       })
     });
   } catch {}
 }
 
-function log(msg) {
-  const t = new Date().toISOString().substr(11, 8);
-  process.stdout.write(`[${t}] ${msg}\n`);
-}
-
-async function updateSolPrice() {
-  try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    const data = await res.json();
-    if (data?.solana?.usd) solPriceUsd = data.solana.usd;
-  } catch {}
-}
-
-async function getSpendableSol() {
+async function getBalance() {
   const bal = await connection.getBalance(wallet.publicKey);
-  return Math.max(0, Number(((bal / LAMPORTS_PER_SOL) - SOL_RESERVE).toFixed(4)));
+  return Math.max(0, (bal / LAMPORTS_PER_SOL) - SOL_RESERVE);
 }
 
 // ====================== SWAP ======================
-async function executeSwap(mint, amount, action = 'buy') {
+async function swap(mint, amount, action = 'buy') {
   try {
-    log(`🔄 ${action.toUpperCase()} ${mint.slice(0, 8)}... | ${amount} SOL`);
+    log(`${action.toUpperCase()} ${mint.slice(0, 8)} | ${amount} SOL`);
 
     const res = await fetch('https://pumpportal.fun/api/trade-local', {
       method: 'POST',
@@ -97,8 +78,8 @@ async function executeSwap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 50,
-        priorityFee: 0.01,
+        slippage: 45,
+        priorityFee: 0.008,
         pool: 'auto'
       })
     });
@@ -108,214 +89,151 @@ async function executeSwap(mint, amount, action = 'buy') {
     const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
     tx.sign([wallet]);
 
-    const txid = await connection.sendTransaction(tx, {
-      skipPreflight: true,
-      maxRetries: 4
-    });
-
-    log(`✅ ${action.toUpperCase()} sent: ${txid}`);
+    const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 3 });
+    log(`SUCCESS ${action}: ${txid}`);
     return txid;
   } catch (err) {
-    log(`❌ ${action.toUpperCase()} failed: ${err.message}`);
+    log(`FAILED ${action}: ${err.message}`);
     return null;
   }
 }
 
-// ====================== PARSER ======================
-function parseEvent(event) {
-  if (!event.mint) return null;
-
-  let mcUsd = 0;
-  if (event.marketCapSol) mcUsd = event.marketCapSol * solPriceUsd;
-  else if (event.marketCapUsd) mcUsd = event.marketCapUsd;
-  else if (event.usd_market_cap) mcUsd = event.usd_market_cap;
-
-  const txType = (event.txType || '').toLowerCase();
-  const isBuy = txType === 'buy';
-  const isSell = txType === 'sell';
-  const isNew = !!(event.initialBuy || event.name || event.symbol);
-
-  let solAmount = event.solAmount || 0;
-  if (solAmount > 1e6) solAmount /= 1e9;
-
-  return {
-    mint: event.mint,
-    mcUsd,
-    solReserves: event.vSolInBondingCurve ? event.vSolInBondingCurve / 1e9 : 0,
-    isBuy,
-    isSell,
-    solAmount,
-    isNew,
-    isTrade: isBuy || isSell
-  };
-}
-
 // ====================== WEBSOCKET ======================
-function startWebSocket() {
+function start() {
   const url = PUMPPORTAL_API_KEY
     ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
     : `wss://pumpportal.fun/api/data`;
 
-  globalWs = new WebSocket(url);
+  ws = new WebSocket(url);
 
-  globalWs.on('open', () => {
-    log('🟢 Connected to PumpPortal');
-    globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    log('📡 Subscribed to new tokens');
+  ws.on('open', () => {
+    log('Connected to PumpPortal');
+    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
-  globalWs.on('message', async (data) => {
+  ws.on('message', async (raw) => {
     try {
-      const event = JSON.parse(data.toString());
-      const parsed = parseEvent(event);
-      if (!parsed) return;
+      const event = JSON.parse(raw.toString());
+      if (!event.mint) return;
 
-      const { mint, mcUsd, solReserves, isBuy, isSell, solAmount, isNew, isTrade } = parsed;
-      const now = Date.now();
+      const mint = event.mint;
+      const txType = (event.txType || '').toLowerCase();
+      const isBuy = txType === 'buy';
+      const isSell = txType === 'sell';
+      const isNew = !!(event.name || event.symbol || event.initialBuy);
 
-      // ========== MANAGE POSITION ==========
-      if (activePositions.has(mint) && mcUsd > 0) {
+      let mc = 0;
+      if (event.marketCapSol) mc = event.marketCapSol * solPrice;
+      else if (event.marketCapUsd) mc = event.marketCapUsd;
+      else if (event.usd_market_cap) mc = event.usd_market_cap;
+
+      let solAmount = event.solAmount || 0;
+      if (solAmount > 1000) solAmount = solAmount / 1e9;
+
+      // ========== EXIT ==========
+      if (activePositions.has(mint) && mc > 0) {
         const pos = activePositions.get(mint);
-        pos.lastUpdate = now;
-        if (mcUsd > pos.highestMc) pos.highestMc = mcUsd;
+        const pnl = ((mc - pos.entry) / pos.entry) * 100;
 
-        const pnl = ((mcUsd - pos.entryMc) / pos.entryMc) * 100;
-        const drop = ((mcUsd - pos.highestMc) / pos.highestMc) * 100;
-
-        let reason = null;
-        if (pnl <= HARD_STOP_LOSS) reason = `Stop-Loss ${pnl.toFixed(1)}%`;
-        else if (pnl >= TAKE_PROFIT) reason = `Take-Profit +${pnl.toFixed(1)}%`;
-        else if (pnl >= TRAILING_ACTIVATION && drop <= TRAILING_DROP) reason = `Trailing ${drop.toFixed(1)}%`;
-        else if (now - pos.buyTime > MAX_HOLD_MS) reason = `Max hold`;
-
-        if (reason) {
+        if (pnl <= STOP_LOSS || pnl >= TAKE_PROFIT) {
           activePositions.delete(mint);
-          log(`🔴 EXIT ${mint.slice(0, 8)} | ${reason}`);
-          const tx = await executeSwap(mint, 0, 'sell');
-          if (tx) {
-            await sendTelegram(`🔴 <b>Closed</b>\n<code>${mint}</code>\n${reason}\nPnL: <b>${pnl.toFixed(1)}%</b>`);
-          }
+          log(`EXIT ${mint.slice(0, 8)} | PnL ${pnl.toFixed(1)}%`);
+          await swap(mint, 0, 'sell');
+          await sendTelegram(`Closed ${mint.slice(0, 8)} | PnL ${pnl.toFixed(1)}%`);
         }
         return;
       }
 
       // ========== NEW TOKEN ==========
-      if (isNew && !tokenTrackers.has(mint) && !processedMints.has(mint)) {
-        tokenTrackers.set(mint, {
-          startSol: solReserves,
-          peakSol: solReserves,
-          firstMc: mcUsd,
-          lastMc: mcUsd,
-          buyCount: 0,
-          sellCount: 0,
-          totalBuySol: 0,
-          createdAt: now,
-          tradeLog: []
+      if (isNew && !trackers.has(mint) && !processed.has(mint)) {
+        trackers.set(mint, {
+          buys: 0,
+          sells: 0,
+          recent: [],
+          mc: mc,
+          start: Date.now()
         });
-        globalWs.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
-        log(`👀 Watching ${mint.slice(0, 8)} | MC $${Math.round(mcUsd)}`);
+        ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+        log(`WATCH ${mint.slice(0, 8)} | MC $${Math.round(mc)}`);
         return;
       }
 
-      // ========== TRADE UPDATE ==========
-      if (tokenTrackers.has(mint) && !processedMints.has(mint) && isTrade) {
-        const t = tokenTrackers.get(mint);
+      // ========== TRADE ==========
+      if (trackers.has(mint) && !processed.has(mint) && (isBuy || isSell)) {
+        tradesReceived++;
+        const t = trackers.get(mint);
 
-        t.tradeLog.push({ time: now, isBuy });
-        t.tradeLog = t.tradeLog.filter(x => now - x.time < 60000);
+        if (isBuy) t.buys++;
+        if (isSell) t.sells++;
+        if (mc > 0) t.mc = mc;
 
-        t.peakSol = Math.max(t.peakSol, solReserves);
-        if (mcUsd > 0) t.lastMc = mcUsd;
+        t.recent.push({ time: Date.now(), buy: isBuy });
+        t.recent = t.recent.filter(x => Date.now() - x.time < 30000);
 
-        if (isBuy) {
-          t.buyCount++;
-          t.totalBuySol += solAmount;
-        }
-        if (isSell) t.sellCount++;
+        const recentBuys = t.recent.filter(x => x.buy).length;
+        const age = (Date.now() - t.start) / 1000;
 
-        const age = (now - t.createdAt) / 1000;
-        const inflow = Math.max(t.totalBuySol, t.peakSol - t.startSol);
-        const total = t.buyCount + t.sellCount;
-        const ratio = total > 0 ? t.buyCount / total : 0;
-        const recentBuys = t.tradeLog.filter(x => x.isBuy && now - x.time <= RECENT_WINDOW_MS).length;
+        // Log every trade
+        log(`TRADE ${mint.slice(0, 6)} | ${isBuy ? 'BUY' : 'SELL'} | MC $${Math.round(t.mc)} | Buys ${t.buys} | Recent ${recentBuys} | Age ${age.toFixed(0)}s`);
 
-        if (t.buyCount > 0 && t.buyCount % 3 === 0) {
-          log(`📈 ${mint.slice(0, 8)} | Age ${age.toFixed(0)}s | MC $${Math.round(t.lastMc)} | +${inflow.toFixed(2)} SOL | Recent ${recentBuys} | Ratio ${(ratio*100).toFixed(0)}%`);
-        }
-
-        // ENTRY
+        // ENTRY CONDITION (very open)
         if (
-          age >= MIN_AGE_SECONDS &&
-          t.lastMc >= MIN_MARKET_CAP_USD &&
-          t.lastMc <= MAX_MARKET_CAP_USD &&
-          inflow >= MIN_SOL_INFLOW &&
-          t.buyCount >= MIN_BUY_TRADES &&
-          ratio >= MIN_BUY_RATIO &&
+          t.mc >= MIN_MC &&
+          t.buys >= MIN_BUYS &&
           recentBuys >= MIN_RECENT_BUYS &&
-          !isBuying &&
+          age > 15 &&
           activePositions.size === 0 &&
-          now - lastLossTime > 4 * 60 * 1000
+          !isBuying
         ) {
-          processedMints.add(mint);
-          tokenTrackers.delete(mint);
+          processed.add(mint);
+          trackers.delete(mint);
 
-          const amount = Math.min(await getSpendableSol(), MAX_BUY_SOL);
+          const amount = Math.min(await getBalance(), MAX_BUY_SOL);
           if (amount < 0.05) return;
 
           isBuying = true;
-          log(`🚀 STRONG MOMENTUM → Buying ${amount} SOL`);
+          log(`BUYING ${amount} SOL → ${mint.slice(0, 8)}`);
 
-          const tx = await executeSwap(mint, amount, 'buy');
+          const tx = await swap(mint, amount, 'buy');
           isBuying = false;
 
           if (tx) {
-            activePositions.set(mint, {
-              entryMc: t.lastMc,
-              highestMc: t.lastMc,
-              buyTime: now,
-              lastUpdate: now
-            });
-            await sendTelegram(
-              `🚀 <b>ENTRY</b>\n<code>${mint}</code>\nSpent: <b>${amount} SOL</b>\nMC: $${t.lastMc.toFixed(0)}\nInflow: +${inflow.toFixed(2)} SOL`
-            );
+            activePositions.set(mint, { entry: t.mc, time: Date.now() });
+            await sendTelegram(`BOUGHT ${mint.slice(0, 8)}\nAmount: ${amount} SOL\nMC: $${Math.round(t.mc)}`);
           }
         }
       }
     } catch (err) {
-      log(`❌ Error: ${err.message}`);
+      log(`Error: ${err.message}`);
     }
   });
 
-  globalWs.on('close', () => {
-    log('⚠️ Reconnecting...');
-    setTimeout(startWebSocket, 4000);
+  ws.on('close', () => {
+    log('Disconnected, reconnecting...');
+    setTimeout(start, 4000);
   });
+
+  ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
 // ====================== MAIN ======================
 async function main() {
-  log(`🔑 Wallet: ${wallet.publicKey.toString()}`);
-  log(`🌐 RPC: ${RPC_ENDPOINT.slice(0, 40)}...`);
-  log(`💰 Max buy: ${MAX_BUY_SOL} SOL`);
+  log(`Wallet: ${wallet.publicKey.toString()}`);
+  log(`RPC: ${RPC_ENDPOINT.slice(0, 50)}...`);
 
-  await updateSolPrice();
-  setInterval(updateSolPrice, 5 * 60 * 1000);
+  // Update SOL price
+  try {
+    const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    const d = await r.json();
+    if (d?.solana?.usd) solPrice = d.solana.usd;
+  } catch {}
 
-  // Force close stale positions
   setInterval(() => {
-    const now = Date.now();
-    for (const [mint, pos] of activePositions) {
-      if (now - pos.lastUpdate > NO_UPDATE_MS) {
-        log(`⚠️ Force closing ${mint.slice(0, 8)}`);
-        activePositions.delete(mint);
-        executeSwap(mint, 0, 'sell');
-      }
-    }
-  }, 5000);
+    log(`Status | Watching: ${trackers.size} | Trades: ${tradesReceived} | Positions: ${activePositions.size}`);
+  }, 30000);
 
-  await sendTelegram(`⚡ <b>Bot Started</b>\nAggressive momentum mode\nHelius RPC + Quick TP`);
-
-  startWebSocket();
+  await sendTelegram('Bot started - Minimal aggressive version');
+  start();
 }
 
 main();
