@@ -21,14 +21,13 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const SOL_RESERVE = 0.05;
 const MAX_BUY_SOL = 0.25;
 
-// ========== ENTRY FILTERS ==========
-const MIN_MARKET_CAP_USD = 12000;
-const MAX_MARKET_CAP_USD = 350000;
-const MIN_AGE_SECONDS = 45;
-const MIN_SOL_INFLOW = 1.5;
+// ========== ENTRY FILTERS (for ongoing trending pumps) ==========
+const MIN_MARKET_CAP_USD = 15000;
+const MAX_MARKET_CAP_USD = 400000;
+const MIN_SOL_INFLOW = 1.8;
 const MIN_BUY_TRADES = 8;
-const MIN_BUY_RATIO = 0.61;
-const MIN_RECENT_BUYS = 5;
+const MIN_BUY_RATIO = 0.62;
+const MIN_RECENT_BUYS = 6;
 const RECENT_WINDOW_MS = 40_000;
 
 // ========== EXIT RULES ==========
@@ -41,7 +40,7 @@ const TAKE_PROFIT = 55.0;
 const MAX_HOLD_MS = 14 * 60 * 1000;
 const NO_UPDATE_FORCE_SELL_MS = 12_000;
 const LOSS_COOLDOWN_MS = 7 * 60 * 1000;
-const TRACKER_TTL_MS = 12 * 60 * 1000;
+const TRACKER_TTL_MS = 15 * 60 * 1000;
 
 // ========== STATE ==========
 let activePositions = new Map();
@@ -158,25 +157,29 @@ async function executeSwap(mint, amountSol, action = 'buy') {
   }
 }
 
-// ====================== DEXSCREENER TRENDING ======================
+// ====================== DEXSCREENER TRENDING ONLY ======================
 async function fetchTrendingTokens() {
   try {
-    // Top boosted tokens (very good source for ongoing pumps)
     const res = await fetch('https://api.dexscreener.com/token-boosts/top/v1', {
       headers: { 'Accept': 'application/json' }
     });
     const data = await res.json();
 
-    if (!Array.isArray(data)) return;
+    if (!Array.isArray(data)) {
+      log('⚠️ DexScreener returned no data');
+      return;
+    }
 
     let added = 0;
+
     for (const item of data) {
       if (item.chainId !== 'solana') continue;
-      const mint = item.tokenAddress;
-      if (!mint || subscribedMints.has(mint) || processedMints.has(mint)) continue;
 
-      // Start tracking this already-live token
+      const mint = item.tokenAddress;
+      if (!mint || subscribedMints.has(mint) || processedMints.has(mint) || activePositions.has(mint)) continue;
+
       subscribedMints.add(mint);
+
       tokenTrackers.set(mint, {
         startSol: 0,
         peakSol: 0,
@@ -185,22 +188,23 @@ async function fetchTrendingTokens() {
         buyCount: 0,
         sellCount: 0,
         totalBuySol: 0,
-        createdAt: Date.now() - 120000, // pretend it's already a bit old
+        createdAt: Date.now(),
         tradeLog: [],
-        mcHistory: [],
-        fromTrending: true
+        mcHistory: []
       });
 
       subscribe(mint);
       added++;
-      log(`🔥 TRENDING → Now watching ${mint.slice(0, 8)}...`);
+      log(`🔥 TRENDING → Watching ${mint.slice(0, 8)}...`);
     }
 
     if (added > 0) {
-      log(`✅ Added ${added} trending tokens from DexScreener`);
+      log(`✅ Added ${added} new trending tokens`);
+    } else {
+      log(`ℹ️ No new trending tokens to add`);
     }
   } catch (err) {
-    log(`⚠️ DexScreener fetch error: ${err.message}`);
+    log(`⚠️ DexScreener error: ${err.message}`);
   }
 }
 
@@ -221,31 +225,28 @@ function parseEvent(event) {
   const txType = (event.txType || event.type || '').toLowerCase();
   const isBuy = txType === 'buy' || event.is_buy === true;
   const isSell = txType === 'sell' || event.is_buy === false;
-  const isNewToken = !!(event.initialBuy || event.name || event.symbol || txType === 'create');
 
   let solAmount = 0;
   if (event.solAmount) {
     solAmount = event.solAmount > 1e6 ? event.solAmount / 1e9 : event.solAmount;
   }
 
-  return { mint, solReserves: solReserves || 0, mcUsd: mcUsd || 0, isBuy, isSell, solAmount, isNewToken, isTrade: (isBuy || isSell) && !isNewToken };
+  return {
+    mint,
+    solReserves: solReserves || 0,
+    mcUsd: mcUsd || 0,
+    isBuy,
+    isSell,
+    solAmount,
+    isTrade: isBuy || isSell
+  };
 }
 
-// ====================== STRUCTURE ======================
+// ====================== HELPERS ======================
 function updateStructure(tracker, mcUsd) {
   const now = Date.now();
   tracker.mcHistory.push({ mc: mcUsd, time: now });
   tracker.mcHistory = tracker.mcHistory.filter(p => now - p.time < 5 * 60 * 1000);
-}
-
-function hasHigherHighsHigherLows(tracker) {
-  const points = tracker.mcHistory.map(p => p.mc);
-  if (points.length < 4) return true; // be more lenient for trending tokens
-  let higherHighs = 0;
-  for (let i = 2; i < points.length; i++) {
-    if (points[i] > points[i - 1]) higherHighs++;
-  }
-  return higherHighs >= 1;
 }
 
 function getRecentBuyPressure(tracker) {
@@ -281,7 +282,7 @@ async function checkStalePositions() {
   const now = Date.now();
   for (const [mint, pos] of activePositions.entries()) {
     if (now - pos.lastUpdate > NO_UPDATE_FORCE_SELL_MS) {
-      log(`⚠️ No update → FORCE SELL ${mint.slice(0,8)}`);
+      log(`⚠️ No update → FORCE SELL ${mint.slice(0, 8)}`);
       activePositions.delete(mint);
       unsubscribe(mint);
       const tx = await executeSwap(mint, 0, 'sell');
@@ -303,9 +304,7 @@ function startWebSocket() {
   globalWs = new WebSocket(url);
 
   globalWs.on('open', () => {
-    log('🟢 WebSocket OPEN');
-    globalWs.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    log('📡 Subscribed to new tokens + will pull trending');
+    log('🟢 WebSocket OPEN – Only Trending Mode');
   });
 
   globalWs.on('message', async (raw) => {
@@ -314,7 +313,7 @@ function startWebSocket() {
       const data = parseEvent(event);
       if (!data) return;
 
-      const { mint, solReserves, mcUsd, isBuy, isSell, solAmount, isNewToken, isTrade } = data;
+      const { mint, solReserves, mcUsd, isBuy, isSell, solAmount, isTrade } = data;
       const now = Date.now();
 
       // Manage open positions
@@ -353,109 +352,88 @@ function startWebSocket() {
         return;
       }
 
-      // New token from PumpPortal
-      if (isNewToken && !processedMints.has(mint) && !tokenTrackers.has(mint)) {
-        tokenTrackers.set(mint, {
-          startSol: solReserves,
-          peakSol: solReserves,
-          firstMc: mcUsd,
-          lastMc: mcUsd,
-          buyCount: 0,
-          sellCount: 0,
-          totalBuySol: 0,
-          createdAt: now,
-          tradeLog: [],
-          mcHistory: [{ mc: mcUsd, time: now }],
-          fromTrending: false
-        });
-        subscribedMints.add(mint);
-        subscribe(mint);
-        log(`👀 NEW → ${mint.slice(0, 8)}... | MC ~$${Math.round(mcUsd)}`);
-        return;
+      // Only process tokens we are tracking from trending
+      if (!tokenTrackers.has(mint) || processedMints.has(mint) || !isTrade) return;
+
+      const t = tokenTrackers.get(mint);
+
+      t.tradeLog.push({ time: now, isBuy, sol: solAmount });
+      t.tradeLog = t.tradeLog.filter(tr => now - tr.time < 6 * 60 * 1000);
+
+      t.peakSol = Math.max(t.peakSol, solReserves);
+      if (mcUsd > 0) {
+        t.lastMc = mcUsd;
+        if (t.firstMc === 0) t.firstMc = mcUsd;
       }
 
-      // Trade updates
-      if (tokenTrackers.has(mint) && !processedMints.has(mint) && isTrade) {
-        const t = tokenTrackers.get(mint);
+      if (isBuy) {
+        t.buyCount++;
+        t.totalBuySol += solAmount;
+      }
+      if (isSell) t.sellCount++;
 
-        t.tradeLog.push({ time: now, isBuy, sol: solAmount });
-        t.tradeLog = t.tradeLog.filter(tr => now - tr.time < 5 * 60 * 1000);
+      updateStructure(t, t.lastMc);
 
-        t.peakSol = Math.max(t.peakSol, solReserves);
-        if (mcUsd > 0) t.lastMc = mcUsd;
-        if (t.firstMc === 0 && mcUsd > 0) t.firstMc = mcUsd;
+      const effectiveVelocity = Math.max(t.totalBuySol, t.peakSol - t.startSol);
+      const totalTrades = t.buyCount + t.sellCount;
+      const buyRatio = totalTrades > 0 ? t.buyCount / totalTrades : 0;
+      const pressure = getRecentBuyPressure(t);
 
-        if (isBuy) {
-          t.buyCount++;
-          t.totalBuySol += solAmount;
+      if (t.buyCount > 0 && t.buyCount % 4 === 0) {
+        log(`📈 ${mint.slice(0, 8)} | MC $${Math.round(t.lastMc)} | +${effectiveVelocity.toFixed(2)} SOL | Buys ${t.buyCount}/${totalTrades} (${(buyRatio*100).toFixed(0)}%) | Recent ${pressure.recentBuys}`);
+      }
+
+      // Entry condition - only ongoing strength
+      const pass =
+        t.lastMc >= MIN_MARKET_CAP_USD &&
+        t.lastMc <= MAX_MARKET_CAP_USD &&
+        effectiveVelocity >= MIN_SOL_INFLOW &&
+        t.buyCount >= MIN_BUY_TRADES &&
+        buyRatio >= MIN_BUY_RATIO &&
+        pressure.recentBuys >= MIN_RECENT_BUYS &&
+        !isBuying &&
+        activePositions.size === 0 &&
+        (now - lastLossTime > LOSS_COOLDOWN_MS);
+
+      if (pass) {
+        processedMints.add(mint);
+        tokenTrackers.delete(mint);
+
+        const spendable = await getSpendableSol();
+        const buyAmount = Math.min(spendable, MAX_BUY_SOL);
+
+        if (buyAmount < 0.05) {
+          unsubscribe(mint);
+          return;
         }
-        if (isSell) t.sellCount++;
 
-        updateStructure(t, t.lastMc);
+        isBuying = true;
+        log(`🚀 TRENDING PUMP → Buying ${buyAmount} SOL`);
+        log(`   ${mint} | MC $${t.lastMc.toFixed(0)} | Recent buys: ${pressure.recentBuys}`);
 
-        const ageSec = (now - t.createdAt) / 1000;
-        const effectiveVelocity = Math.max(t.totalBuySol, t.peakSol - t.startSol);
-        const totalTrades = t.buyCount + t.sellCount;
-        const buyRatio = totalTrades > 0 ? t.buyCount / totalTrades : 0;
-        const pressure = getRecentBuyPressure(t);
-        const goodStructure = hasHigherHighsHigherLows(t);
+        const tx = await executeSwap(mint, buyAmount, 'buy');
+        isBuying = false;
 
-        if (t.buyCount > 0 && t.buyCount % 4 === 0) {
-          log(`📈 ${mint.slice(0, 8)} | Age ${ageSec.toFixed(0)}s | MC $${Math.round(t.lastMc)} | +${effectiveVelocity.toFixed(2)} SOL | Recent ${pressure.recentBuys} | ${t.fromTrending ? 'TRENDING' : 'NEW'}`);
-        }
+        if (tx) {
+          activePositions.set(mint, {
+            entryMc: t.lastMc,
+            highestMc: t.lastMc,
+            buyTime: now,
+            lastUpdate: now
+          });
+          subscribe(mint);
 
-        const pass =
-          ageSec >= MIN_AGE_SECONDS &&
-          t.lastMc >= MIN_MARKET_CAP_USD &&
-          t.lastMc <= MAX_MARKET_CAP_USD &&
-          effectiveVelocity >= MIN_SOL_INFLOW &&
-          t.buyCount >= MIN_BUY_TRADES &&
-          buyRatio >= MIN_BUY_RATIO &&
-          pressure.recentBuys >= MIN_RECENT_BUYS &&
-          goodStructure &&
-          !isBuying &&
-          activePositions.size === 0 &&
-          (now - lastLossTime > LOSS_COOLDOWN_MS);
-
-        if (pass) {
-          processedMints.add(mint);
-          tokenTrackers.delete(mint);
-
-          const spendable = await getSpendableSol();
-          const buyAmount = Math.min(spendable, MAX_BUY_SOL);
-
-          if (buyAmount < 0.05) {
-            unsubscribe(mint);
-            return;
-          }
-
-          isBuying = true;
-          log(`🚀 PUMP SIGNAL → Buying ${buyAmount} SOL of ${mint.slice(0,8)}`);
-
-          const tx = await executeSwap(mint, buyAmount, 'buy');
-          isBuying = false;
-
-          if (tx) {
-            activePositions.set(mint, {
-              entryMc: t.lastMc,
-              highestMc: t.lastMc,
-              buyTime: now,
-              lastUpdate: now
-            });
-            subscribe(mint);
-
-            await sendTelegram(
-              `🚀 <b>PUMP ENTRY</b>\n` +
-              `Mint: <code>${mint}</code>\n` +
-              `Spent: <b>${buyAmount} SOL</b>\n` +
-              `MC: $${t.lastMc.toFixed(0)}\n` +
-              `Recent buys: ${pressure.recentBuys}\n` +
-              `Source: ${t.fromTrending ? 'DexScreener Trending' : 'New Token'}\n` +
-              `<a href="https://solscan.io/tx/${tx}">Tx</a>`
-            );
-          } else {
-            unsubscribe(mint);
-          }
+          await sendTelegram(
+            `🚀 <b>TRENDING PUMP ENTRY</b>\n` +
+            `Mint: <code>${mint}</code>\n` +
+            `Spent: <b>${buyAmount} SOL</b>\n` +
+            `MC: $${t.lastMc.toFixed(0)}\n` +
+            `Recent buys: ${pressure.recentBuys}\n` +
+            `Total buys: ${t.buyCount}\n` +
+            `<a href="https://solscan.io/tx/${tx}">Tx</a>`
+          );
+        } else {
+          unsubscribe(mint);
         }
       }
     } catch (err) {
@@ -481,15 +459,15 @@ async function main() {
   setInterval(cleanupTrackers, 60_000);
   setInterval(checkStalePositions, 4000);
 
-  // Fetch trending tokens every 40 seconds
+  // Only trending discovery
   await fetchTrendingTokens();
-  setInterval(fetchTrendingTokens, 40_000);
+  setInterval(fetchTrendingTokens, 45_000);
 
   setInterval(() => {
-    log(`💓 Status | Watching: ${tokenTrackers.size} | Open: ${activePositions.size} | Subscribed: ${subscribedMints.size}`);
+    log(`💓 Status | Watching: ${tokenTrackers.size} | Open: ${activePositions.size}`);
   }, 3 * 60 * 1000);
 
-  await sendTelegram(`⚡ <b>Bot updated – DexScreener Trending Mode</b>\nNow hunting ongoing pumps + new tokens`);
+  await sendTelegram(`⚡ <b>Bot Mode: ONLY TRENDING</b>\nNo more new launches\nHunting ongoing pumps only`);
 
   startWebSocket();
 }
