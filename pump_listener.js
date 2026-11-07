@@ -18,25 +18,26 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== MORE REALISTIC ENTRY FILTERS ======
+// ====== STRICTER QUALITY FILTERS ======
 const MAX_BUY_SOL = 0.15;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 2800;              // Lowered
-const MAX_MC = 150000;
-const MIN_INITIAL_BUY = 0.15;     // Lowered
+const MIN_MC = 9000;               // Higher to avoid micro rugs
+const MAX_MC = 120000;
+const MIN_INITIAL_BUY = 0.55;      // Much stronger initial buy required
 
-// Exit
-const HARD_STOP_LOSS = -7.0;
-const TRAILING_ACTIVATE = 10.0;
-const TRAILING_DROP = -5.5;
-const TAKE_PROFIT = 35.0;
-const MAX_HOLD_SECONDS = 420;
+// Exit (more protective)
+const HARD_STOP_LOSS = -8.0;
+const TRAILING_ACTIVATE = 12.0;
+const TRAILING_DROP = -6.0;
+const TAKE_PROFIT = 38.0;
+const MAX_HOLD_SECONDS = 360;
 
 let activePosition = null;
 let processed = new Set();
 let isBuying = false;
 let solPrice = 180;
+let lastBuyTime = 0;
 let ws = null;
 
 // ====================== HELPERS ======================
@@ -78,7 +79,7 @@ async function swap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 50,
+        slippage: 48,
         priorityFee: 0.012,
         pool: 'auto'
       })
@@ -120,7 +121,7 @@ async function checkPosition() {
   const dropFromHigh = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
   const held = (Date.now() - activePosition.entryTime) / 1000;
 
-  log(`Monitor → PnL ${pnl.toFixed(1)}% | Drop from high ${dropFromHigh.toFixed(1)}%`);
+  log(`Monitor → PnL ${pnl.toFixed(1)}% | Drop ${dropFromHigh.toFixed(1)}%`);
 
   let reason = null;
   if (pnl <= HARD_STOP_LOSS) reason = `Hard SL ${pnl.toFixed(1)}%`;
@@ -147,11 +148,11 @@ function startWebSocket() {
     ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
     : `wss://pumpportal.fun/api/data`;
 
-  log('Connecting to PumpPortal...');
+  log('Connecting...');
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected');
+    log('🟢 Connected – Strict Quality Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -165,44 +166,55 @@ function startWebSocket() {
 
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
+      // Cooldown between buys (45 seconds)
+      if (Date.now() - lastBuyTime < 45000) return;
+
       const name = (event.name || event.symbol || '').trim();
 
       let mc = 0;
       if (event.marketCapSol) mc = event.marketCapSol * solPrice;
       else if (event.marketCapUsd) mc = event.marketCapUsd;
-      else if (event.usd_market_cap) mc = event.usd_market_cap;
 
       let initialBuy = 0;
       if (event.initialBuy) {
         initialBuy = event.initialBuy > 1e7 ? event.initialBuy / 1e9 : event.initialBuy;
-      } else if (event.solAmount) {
-        initialBuy = event.solAmount > 1e7 ? event.solAmount / 1e9 : event.solAmount;
       }
-
-      // Fix crazy values
-      if (initialBuy > 100) initialBuy = initialBuy / 1e9;
+      if (initialBuy > 50) initialBuy = initialBuy / 1e9;
 
       log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 16)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
+      // Strict filters
+      if (
+        mc >= MIN_MC &&
+        mc <= MAX_MC &&
+        initialBuy >= MIN_INITIAL_BUY &&
+        name.length >= 3
+      ) {
         processed.add(mint);
 
         const amount = Math.min(await getBalance(), MAX_BUY_SOL);
-        if (amount < 0.05) return;
+        if (amount < 0.06) return;
 
         isBuying = true;
-        log(`🚀 BUYING ${amount} SOL → ${mint.slice(0, 8)}`);
+        log(`🚀 QUALITY BUY ${amount} SOL`);
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
         if (tx) {
+          lastBuyTime = Date.now();
           activePosition = {
             mint,
             entryMc: mc,
             highestMc: mc,
             entryTime: Date.now()
           };
-          await sendTelegram(`🚀 <b>ENTRY</b>\n<code>${mint}</code>\nSpent: ${amount} SOL\nMC: $${Math.round(mc)}\nInit: ${initialBuy.toFixed(2)} SOL`);
+          await sendTelegram(
+            `🚀 <b>QUALITY ENTRY</b>\n` +
+            `Mint: <code>${mint}</code>\n` +
+            `Spent: <b>${amount} SOL</b>\n` +
+            `MC: $${Math.round(mc)}\n` +
+            `Init Buy: ${initialBuy.toFixed(2)} SOL`
+          );
         }
       }
     } catch (err) {
@@ -211,20 +223,17 @@ function startWebSocket() {
   });
 
   ws.on('close', () => {
-    log('Connection closed – reconnecting in 5s');
+    log('Reconnecting in 5s...');
     setTimeout(startWebSocket, 5000);
   });
 
-  ws.on('error', (err) => {
-    log(`WS Error: ${err.message}`);
-  });
+  ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Mode: Realistic Entry + Wave Rider`);
-  log(`Min MC: $${MIN_MC} | Min InitBuy: ${MIN_INITIAL_BUY} SOL`);
+  log(`Strict Mode: Min InitBuy ${MIN_INITIAL_BUY} SOL | Min MC $${MIN_MC}`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -232,9 +241,9 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  setInterval(checkPosition, 8000);
+  setInterval(checkPosition, 7000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nLower entry filters\nActive trailing stop`);
+  await sendTelegram(`⚡ <b>Strict Quality Mode Activated</b>\nMin InitBuy: ${MIN_INITIAL_BUY} SOL`);
   startWebSocket();
 }
 
