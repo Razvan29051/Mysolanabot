@@ -18,18 +18,18 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== SNIPER SETTINGS ======
+// ====== AGGRESSIVE SNIPER SETTINGS ======
 const MAX_BUY_SOL = 0.18;
 const SOL_RESERVE = 0.04;
 
-const MIN_INITIAL_MC = 9000;          // Minimum market cap at creation
-const MAX_INITIAL_MC = 120000;        // Don't buy if already too high
-const MIN_INITIAL_BUY = 0.8;          // Minimum SOL in initial buy
+const MIN_INITIAL_MC = 4500;          // Lowered
+const MAX_INITIAL_MC = 150000;
+const MIN_INITIAL_BUY = 0.25;         // Lowered
 
 // Exit settings
 const STOP_LOSS = -7;
-const TAKE_PROFIT = 28;
-const MAX_HOLD_SECONDS = 420;         // 7 minutes max
+const TAKE_PROFIT = 32;
+const MAX_HOLD_SECONDS = 480;         // 8 minutes
 
 // State
 let activePosition = null;
@@ -79,8 +79,8 @@ async function swap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 50,
-        priorityFee: 0.01,
+        slippage: 52,
+        priorityFee: 0.012,
         pool: 'auto'
       })
     });
@@ -92,7 +92,7 @@ async function swap(mint, amount, action = 'buy') {
 
     const txid = await connection.sendTransaction(tx, {
       skipPreflight: true,
-      maxRetries: 4
+      maxRetries: 5
     });
 
     log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
@@ -109,12 +109,10 @@ function startWebSocket() {
     ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
     : `wss://pumpportal.fun/api/data`;
 
-  log(`Connecting... API Key: ${PUMPPORTAL_API_KEY ? 'YES' : 'NO'}`);
-
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Early Sniper Mode');
+    log('🟢 Connected – Aggressive Early Sniper');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -126,9 +124,35 @@ function startWebSocket() {
       const mint = event.mint;
       const isNew = !!(event.name || event.symbol || event.initialBuy || event.txType === 'create');
 
+      // ========== EXIT MONITORING ==========
+      if (activePosition && event.mint === activePosition.mint) {
+        let mc = 0;
+        if (event.marketCapSol) mc = event.marketCapSol * solPrice;
+        else if (event.marketCapUsd) mc = event.marketCapUsd;
+
+        if (mc > 0) {
+          const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
+          const holdTime = (Date.now() - activePosition.entryTime) / 1000;
+
+          let reason = null;
+          if (pnl <= STOP_LOSS) reason = `Stop-Loss ${pnl.toFixed(1)}%`;
+          else if (pnl >= TAKE_PROFIT) reason = `Take-Profit +${pnl.toFixed(1)}%`;
+          else if (holdTime > MAX_HOLD_SECONDS) reason = `Max hold`;
+
+          if (reason) {
+            log(`🔴 EXIT ${mint.slice(0, 8)} | ${reason}`);
+            const oldMint = activePosition.mint;
+            activePosition = null;
+            await swap(oldMint, 0, 'sell');
+            await sendTelegram(`🔴 Closed <code>${oldMint.slice(0, 8)}</code>\n${reason}`);
+          }
+        }
+        return;
+      }
+
+      // ========== NEW TOKEN ENTRY ==========
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
-      // Calculate initial values
       let mc = 0;
       if (event.marketCapSol) mc = event.marketCapSol * solPrice;
       else if (event.marketCapUsd) mc = event.marketCapUsd;
@@ -141,24 +165,17 @@ function startWebSocket() {
         initialBuy = event.solAmount > 1000 ? event.solAmount / 1e9 : event.solAmount;
       }
 
-      log(`New token: ${mint.slice(0, 8)} | MC $${Math.round(mc)} | InitialBuy ${initialBuy.toFixed(2)} SOL`);
+      log(`New: ${mint.slice(0, 8)} | MC $${Math.round(mc)} | InitBuy ${initialBuy.toFixed(2)} SOL`);
 
-      // ===== SNIPER ENTRY CONDITION =====
-      if (
-        mc >= MIN_INITIAL_MC &&
-        mc <= MAX_INITIAL_MC &&
-        initialBuy >= MIN_INITIAL_BUY
-      ) {
+      // Aggressive entry condition
+      if (mc >= MIN_INITIAL_MC && mc <= MAX_INITIAL_MC && initialBuy >= MIN_INITIAL_BUY) {
         processed.add(mint);
 
         const amount = Math.min(await getBalance(), MAX_BUY_SOL);
-        if (amount < 0.06) {
-          log('Not enough balance');
-          return;
-        }
+        if (amount < 0.06) return;
 
         isBuying = true;
-        log(`🚀 EARLY SNIPER → Buying ${amount} SOL`);
+        log(`🚀 SNIPING ${amount} SOL → ${mint.slice(0, 8)}`);
 
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
@@ -167,21 +184,20 @@ function startWebSocket() {
           activePosition = {
             mint,
             entryMc: mc,
-            entryTime: Date.now(),
-            amount
+            entryTime: Date.now()
           };
 
+          // Try to get updates for exit
+          ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+
           await sendTelegram(
-            `🚀 <b>EARLY SNIPER ENTRY</b>\n` +
+            `🚀 <b>EARLY SNIPER</b>\n` +
             `Mint: <code>${mint}</code>\n` +
             `Spent: <b>${amount} SOL</b>\n` +
             `MC: $${Math.round(mc)}\n` +
-            `Initial Buy: ${initialBuy.toFixed(2)} SOL\n` +
+            `Initial: ${initialBuy.toFixed(2)} SOL\n` +
             `<a href="https://solscan.io/tx/${tx}">Tx</a>`
           );
-
-          // Subscribe to trades just for exit monitoring (even if flaky)
-          ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
         }
       }
     } catch (err) {
@@ -189,43 +205,8 @@ function startWebSocket() {
     }
   });
 
-  // Monitor open position with whatever trade data comes
-  ws.on('message', async (raw) => {
-    if (!activePosition) return;
-
-    try {
-      const event = JSON.parse(raw.toString());
-      if (event.mint !== activePosition.mint) return;
-
-      let mc = 0;
-      if (event.marketCapSol) mc = event.marketCapSol * solPrice;
-      else if (event.marketCapUsd) mc = event.marketCapUsd;
-
-      if (mc <= 0) return;
-
-      const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
-      const holdTime = (Date.now() - activePosition.entryTime) / 1000;
-
-      let reason = null;
-      if (pnl <= STOP_LOSS) reason = `Stop-Loss ${pnl.toFixed(1)}%`;
-      else if (pnl >= TAKE_PROFIT) reason = `Take-Profit +${pnl.toFixed(1)}%`;
-      else if (holdTime > MAX_HOLD_SECONDS) reason = `Max hold time`;
-
-      if (reason) {
-        log(`🔴 EXIT ${activePosition.mint.slice(0, 8)} | ${reason}`);
-        const mint = activePosition.mint;
-        activePosition = null;
-
-        const tx = await swap(mint, 0, 'sell');
-        if (tx) {
-          await sendTelegram(`🔴 Closed <code>${mint.slice(0, 8)}</code>\n${reason}`);
-        }
-      }
-    } catch {}
-  });
-
   ws.on('close', () => {
-    log('WS Closed – reconnecting in 4s');
+    log('Reconnecting in 4s...');
     setTimeout(startWebSocket, 4000);
   });
 
@@ -235,9 +216,8 @@ function startWebSocket() {
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`RPC: ${RPC_ENDPOINT.slice(0, 55)}...`);
-  log(`Mode: EARLY SNIPER`);
-  log(`Min MC: $${MIN_INITIAL_MC} | Max Buy: ${MAX_BUY_SOL} SOL`);
+  log(`Mode: Aggressive Early Sniper`);
+  log(`Min MC: $${MIN_INITIAL_MC} | Min InitBuy: ${MIN_INITIAL_BUY} SOL`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -245,21 +225,18 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  // Safety: force close if position is open too long without updates
+  // Safety timeout
   setInterval(async () => {
-    if (activePosition && Date.now() - activePosition.entryTime > MAX_HOLD_SECONDS * 1000) {
-      log('Force closing old position');
+    if (activePosition && (Date.now() - activePosition.entryTime) / 1000 > MAX_HOLD_SECONDS) {
+      log('Force closing position');
       const mint = activePosition.mint;
       activePosition = null;
       await swap(mint, 0, 'sell');
     }
-  }, 15000);
+  }, 10000);
 
-  await sendTelegram(`⚡ <b>Early Sniper Started</b>\nMin MC: $${MIN_INITIAL_MC}\nMax buy: ${MAX_BUY_SOL} SOL`);
+  await sendTelegram(`⚡ <b>Aggressive Early Sniper</b>\nMin MC: $${MIN_INITIAL_MC}\nMin InitBuy: ${MIN_INITIAL_BUY} SOL`);
   startWebSocket();
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+main();
