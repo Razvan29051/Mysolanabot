@@ -18,24 +18,26 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const MAX_BUY_SOL = 0.16;
+// ====== MORE REALISTIC ENTRY FILTERS ======
+const MAX_BUY_SOL = 0.15;
 const SOL_RESERVE = 0.04;
-const MIN_MC = 7500;
-const MAX_MC = 140000;
-const MIN_INITIAL_BUY = 0.40;
 
+const MIN_MC = 2800;              // Lowered
+const MAX_MC = 150000;
+const MIN_INITIAL_BUY = 0.15;     // Lowered
+
+// Exit
 const HARD_STOP_LOSS = -7.0;
-const TRAILING_ACTIVATE = 11.0;
+const TRAILING_ACTIVATE = 10.0;
 const TRAILING_DROP = -5.5;
-const TAKE_PROFIT = 40.0;
-const MAX_HOLD_SECONDS = 480;
+const TAKE_PROFIT = 35.0;
+const MAX_HOLD_SECONDS = 420;
 
 let activePosition = null;
 let processed = new Set();
 let isBuying = false;
 let solPrice = 180;
 let ws = null;
-let reconnectTimeout = null;
 
 // ====================== HELPERS ======================
 function log(msg) {
@@ -105,7 +107,7 @@ async function getCurrentMc(mint) {
   return 0;
 }
 
-// ====================== POSITION MONITOR ======================
+// ====================== MONITOR ======================
 async function checkPosition() {
   if (!activePosition) return;
 
@@ -118,7 +120,7 @@ async function checkPosition() {
   const dropFromHigh = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
   const held = (Date.now() - activePosition.entryTime) / 1000;
 
-  log(`Monitor: PnL ${pnl.toFixed(1)}% | Drop ${dropFromHigh.toFixed(1)}%`);
+  log(`Monitor → PnL ${pnl.toFixed(1)}% | Drop from high ${dropFromHigh.toFixed(1)}%`);
 
   let reason = null;
   if (pnl <= HARD_STOP_LOSS) reason = `Hard SL ${pnl.toFixed(1)}%`;
@@ -149,7 +151,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 PumpPortal connected');
+    log('🟢 Connected');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -164,24 +166,32 @@ function startWebSocket() {
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
       const name = (event.name || event.symbol || '').trim();
+
       let mc = 0;
       if (event.marketCapSol) mc = event.marketCapSol * solPrice;
       else if (event.marketCapUsd) mc = event.marketCapUsd;
+      else if (event.usd_market_cap) mc = event.usd_market_cap;
 
       let initialBuy = 0;
       if (event.initialBuy) {
-        initialBuy = event.initialBuy > 1e6 ? event.initialBuy / 1e9 : event.initialBuy;
+        initialBuy = event.initialBuy > 1e7 ? event.initialBuy / 1e9 : event.initialBuy;
+      } else if (event.solAmount) {
+        initialBuy = event.solAmount > 1e7 ? event.solAmount / 1e9 : event.solAmount;
       }
 
-      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 18)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+      // Fix crazy values
+      if (initialBuy > 100) initialBuy = initialBuy / 1e9;
 
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 3) {
+      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 16)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+
+      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
         processed.add(mint);
+
         const amount = Math.min(await getBalance(), MAX_BUY_SOL);
-        if (amount < 0.06) return;
+        if (amount < 0.05) return;
 
         isBuying = true;
-        log(`🚀 BUYING ${amount} SOL`);
+        log(`🚀 BUYING ${amount} SOL → ${mint.slice(0, 8)}`);
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
@@ -192,30 +202,29 @@ function startWebSocket() {
             highestMc: mc,
             entryTime: Date.now()
           };
-          await sendTelegram(`🚀 <b>ENTRY</b>\n<code>${mint}</code>\n${amount} SOL\nMC $${Math.round(mc)}`);
+          await sendTelegram(`🚀 <b>ENTRY</b>\n<code>${mint}</code>\nSpent: ${amount} SOL\nMC: $${Math.round(mc)}\nInit: ${initialBuy.toFixed(2)} SOL`);
         }
       }
     } catch (err) {
-      log(`Message error: ${err.message}`);
+      log(`Error: ${err.message}`);
     }
   });
 
   ws.on('close', () => {
-    log('PumpPortal closed – reconnecting in 5s');
-    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    reconnectTimeout = setTimeout(startWebSocket, 5000);
+    log('Connection closed – reconnecting in 5s');
+    setTimeout(startWebSocket, 5000);
   });
 
   ws.on('error', (err) => {
-    log(`PumpPortal error: ${err.message}`);
-    // Do not crash – just let the close handler reconnect
+    log(`WS Error: ${err.message}`);
   });
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Mode: Stable Wave Rider + Monitor`);
+  log(`Mode: Realistic Entry + Wave Rider`);
+  log(`Min MC: $${MIN_MC} | Min InitBuy: ${MIN_INITIAL_BUY} SOL`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -223,13 +232,10 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  // Active monitor every 8 seconds
   setInterval(checkPosition, 8000);
 
-  await sendTelegram(`⚡ <b>Stable Wave Rider Started</b>`);
+  await sendTelegram(`⚡ <b>Bot Updated</b>\nLower entry filters\nActive trailing stop`);
   startWebSocket();
 }
 
-main().catch(err => {
-  console.error(err);
-});
+main();
