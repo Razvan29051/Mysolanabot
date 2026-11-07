@@ -18,17 +18,19 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
+// ====== BALANCED SETTINGS ======
 const MAX_BUY_SOL = 0.15;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 9000;
-const MAX_MC = 130000;
-const MIN_INITIAL_BUY = 0.55;
+const MIN_MC = 5500;               // Lowered (was 9000)
+const MAX_MC = 140000;
+const MIN_INITIAL_BUY = 0.50;      // Still strong buy signal
 
+// Exit settings
 const HARD_STOP_LOSS = -8.0;
-const TRAILING_ACTIVATE = 12.0;
-const TRAILING_DROP = -6.0;
-const TAKE_PROFIT = 38.0;
+const TRAILING_ACTIVATE = 11.0;
+const TRAILING_DROP = -5.8;
+const TAKE_PROFIT = 36.0;
 const MAX_HOLD_SECONDS = 360;
 
 let activePosition = null;
@@ -65,7 +67,6 @@ async function getBalance() {
   return Math.max(0, Number(((bal / LAMPORTS_PER_SOL) - SOL_RESERVE).toFixed(4)));
 }
 
-// ====================== IMPROVED SWAP ======================
 async function swap(mint, amount, action = 'buy') {
   const maxRetries = 3;
 
@@ -90,10 +91,7 @@ async function swap(mint, amount, action = 'buy') {
         body: JSON.stringify(body)
       });
 
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(errText);
-      }
+      if (!res.ok) throw new Error(await res.text());
 
       const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
       tx.sign([wallet]);
@@ -103,13 +101,11 @@ async function swap(mint, amount, action = 'buy') {
         maxRetries: 4
       });
 
-      // Wait a bit and check confirmation
       await new Promise(r => setTimeout(r, 2500));
-
       const status = await connection.getSignatureStatus(txid);
-      
+
       if (status?.value?.err) {
-        throw new Error(`Transaction failed on-chain: ${JSON.stringify(status.value.err)}`);
+        throw new Error(`On-chain error: ${JSON.stringify(status.value.err)}`);
       }
 
       log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
@@ -163,11 +159,11 @@ async function checkPosition() {
     activePosition = null;
 
     const txid = await swap(mint, 0, 'sell');
-    
+
     if (txid) {
-      await sendTelegram(`🔴 Closed <code>${mint.slice(0, 8)}</code>\n${reason}\nPnL: <b>${pnl.toFixed(1)}%</b>\nTx: ${txid.slice(0, 20)}...`);
+      await sendTelegram(`🔴 Closed <code>${mint.slice(0, 8)}</code>\n${reason}\nPnL: <b>${pnl.toFixed(1)}%</b>`);
     } else {
-      await sendTelegram(`⚠️ FAILED TO SELL <code>${mint.slice(0, 8)}</code>\nPlease sell manually!`);
+      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nSell manually!`);
     }
   }
 }
@@ -186,7 +182,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Strict Quality + Better Sells');
+    log('🟢 Connected – Balanced Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -199,7 +195,7 @@ function startWebSocket() {
       const isNew = !!(event.name || event.symbol || event.initialBuy);
 
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
-      if (Date.now() - lastBuyTime < 45000) return;
+      if (Date.now() - lastBuyTime < 40000) return;
 
       const name = (event.name || event.symbol || '').trim();
 
@@ -222,7 +218,7 @@ function startWebSocket() {
         if (amount < 0.06) return;
 
         isBuying = true;
-        log(`🚀 QUALITY BUY ${amount} SOL`);
+        log(`🚀 BUY ${amount} SOL`);
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
@@ -234,7 +230,7 @@ function startWebSocket() {
             highestMc: mc,
             entryTime: Date.now()
           };
-          await sendTelegram(`🚀 <b>QUALITY ENTRY</b>\n<code>${mint}</code>\n${amount} SOL\nMC $${Math.round(mc)}\nInit: ${initialBuy.toFixed(2)}`);
+          await sendTelegram(`🚀 <b>ENTRY</b>\n<code>${mint}</code>\n${amount} SOL\nMC $${Math.round(mc)}\nInit: ${initialBuy.toFixed(2)} SOL`);
         }
       }
     } catch (err) {
@@ -253,7 +249,7 @@ function startWebSocket() {
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Strict Quality Mode + Improved Sell`);
+  log(`Balanced Mode → Min MC $${MIN_MC} | Min InitBuy ${MIN_INITIAL_BUY} SOL`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -263,7 +259,7 @@ async function main() {
 
   setInterval(checkPosition, 7000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nBetter sell logic + retries`);
+  await sendTelegram(`⚡ <b>Balanced Mode</b>\nMin MC: $${MIN_MC}\nMin InitBuy: ${MIN_INITIAL_BUY} SOL`);
   startWebSocket();
 }
 
