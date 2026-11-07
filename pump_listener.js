@@ -18,19 +18,19 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== ENTRY SETTINGS ======
+// Settings
 const MAX_BUY_SOL = 0.16;
 const SOL_RESERVE = 0.04;
 const MIN_MC = 7500;
 const MAX_MC = 140000;
 const MIN_INITIAL_BUY = 0.40;
 
-// ====== EXIT SETTINGS (Wave Riding) ======
-const HARD_STOP_LOSS = -7.0;          // Emergency exit
-const TRAILING_ACTIVATE = 12.0;       // Start trailing after +12%
-const TRAILING_DROP = -6.0;           // Sell if it drops 6% from highest point
-const TAKE_PROFIT = 45.0;             // Final take profit
-const MAX_HOLD_SECONDS = 480;         // 8 minutes max
+// Exit settings
+const HARD_STOP_LOSS = -7.0;
+const TRAILING_ACTIVATE = 11.0;
+const TRAILING_DROP = -5.5;
+const TAKE_PROFIT = 40.0;
+const MAX_HOLD_SECONDS = 480;
 
 // State
 let activePosition = null;
@@ -68,7 +68,6 @@ async function getBalance() {
 async function swap(mint, amount, action = 'buy') {
   try {
     log(`${action.toUpperCase()} → ${mint.slice(0, 8)} | ${amount} SOL`);
-
     const res = await fetch('https://pumpportal.fun/api/trade-local', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -83,22 +82,61 @@ async function swap(mint, amount, action = 'buy') {
         pool: 'auto'
       })
     });
-
     if (!res.ok) throw new Error(await res.text());
-
     const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
     tx.sign([wallet]);
-
-    const txid = await connection.sendTransaction(tx, {
-      skipPreflight: true,
-      maxRetries: 5
-    });
-
+    const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 5 });
     log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
     return txid;
   } catch (err) {
     log(`❌ ${action.toUpperCase()} FAILED: ${err.message}`);
     return null;
+  }
+}
+
+// Get current MC from DexScreener (backup)
+async function getCurrentMc(mint) {
+  try {
+    const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+    const data = await res.json();
+    if (data.pairs && data.pairs.length > 0) {
+      // Prefer the pair with highest liquidity
+      const pair = data.pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+      return parseFloat(pair.marketCap || pair.fdv || 0);
+    }
+  } catch (e) {}
+  return 0;
+}
+
+// ====================== EXIT CHECKER (Important) ======================
+async function checkPosition() {
+  if (!activePosition) return;
+
+  const mc = await getCurrentMc(activePosition.mint);
+  if (mc <= 0) return;
+
+  if (mc > activePosition.highestMc) {
+    activePosition.highestMc = mc;
+  }
+
+  const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
+  const dropFromHigh = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
+  const held = (Date.now() - activePosition.entryTime) / 1000;
+
+  log(`Position check: PnL ${pnl.toFixed(1)}% | Drop from high ${dropFromHigh.toFixed(1)}%`);
+
+  let reason = null;
+  if (pnl <= HARD_STOP_LOSS) reason = `Hard SL ${pnl.toFixed(1)}%`;
+  else if (pnl >= TRAILING_ACTIVATE && dropFromHigh <= TRAILING_DROP) reason = `Trailing ${dropFromHigh.toFixed(1)}%`;
+  else if (pnl >= TAKE_PROFIT) reason = `Take-Profit +${pnl.toFixed(1)}%`;
+  else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
+
+  if (reason) {
+    log(`🔴 EXIT ${activePosition.mint.slice(0, 8)} | ${reason}`);
+    const mint = activePosition.mint;
+    activePosition = null;
+    await swap(mint, 0, 'sell');
+    await sendTelegram(`🔴 Closed <code>${mint.slice(0, 8)}</code>\n${reason}\nPnL: <b>${pnl.toFixed(1)}%</b>`);
   }
 }
 
@@ -111,7 +149,7 @@ function startWebSocket() {
   const ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Wave Rider Mode');
+    log('🟢 Connected – Wave Rider + Active Monitor');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -122,54 +160,17 @@ function startWebSocket() {
 
       const mint = event.mint;
 
-      // ========== EXIT LOGIC (Trailing) ==========
+      // Still try to use live events if they come
       if (activePosition && mint === activePosition.mint) {
         let mc = 0;
         if (event.marketCapSol) mc = event.marketCapSol * solPrice;
         else if (event.marketCapUsd) mc = event.marketCapUsd;
-
         if (mc > 0) {
-          // Update highest MC
-          if (mc > activePosition.highestMc) {
-            activePosition.highestMc = mc;
-          }
-
-          const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
-          const dropFromHigh = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
-          const held = (Date.now() - activePosition.entryTime) / 1000;
-
-          let reason = null;
-
-          // Hard stop loss
-          if (pnl <= HARD_STOP_LOSS) {
-            reason = `Hard Stop-Loss ${pnl.toFixed(1)}%`;
-          }
-          // Trailing stop (only after activation)
-          else if (pnl >= TRAILING_ACTIVATE && dropFromHigh <= TRAILING_DROP) {
-            reason = `Trailing Stop ${dropFromHigh.toFixed(1)}% from high`;
-          }
-          // Final take profit
-          else if (pnl >= TAKE_PROFIT) {
-            reason = `Take-Profit +${pnl.toFixed(1)}%`;
-          }
-          // Max hold time
-          else if (held > MAX_HOLD_SECONDS) {
-            reason = `Max hold time`;
-          }
-
-          if (reason) {
-            log(`🔴 EXIT ${mint.slice(0, 8)} | ${reason} | PnL ${pnl.toFixed(1)}%`);
-            const oldMint = activePosition.mint;
-            activePosition = null;
-            await swap(oldMint, 0, 'sell');
-            await sendTelegram(`🔴 Closed <code>${oldMint.slice(0, 8)}</code>\n${reason}\nPnL: <b>${pnl.toFixed(1)}%</b>`);
-          }
+          if (mc > activePosition.highestMc) activePosition.highestMc = mc;
         }
-        return;
       }
 
-      // ========== ENTRY ==========
-      const isNew = !!(event.name || event.symbol || event.initialBuy || event.txType === 'create');
+      const isNew = !!(event.name || event.symbol || event.initialBuy);
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
       const name = (event.name || event.symbol || '').trim();
@@ -182,22 +183,15 @@ function startWebSocket() {
         initialBuy = event.initialBuy > 1e6 ? event.initialBuy / 1e9 : event.initialBuy;
       }
 
-      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 20)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 18)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
-      if (
-        mc >= MIN_MC &&
-        mc <= MAX_MC &&
-        initialBuy >= MIN_INITIAL_BUY &&
-        name.length >= 3
-      ) {
+      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 3) {
         processed.add(mint);
-
         const amount = Math.min(await getBalance(), MAX_BUY_SOL);
         if (amount < 0.06) return;
 
         isBuying = true;
-        log(`🚀 ENTRY ${amount} SOL → ${mint.slice(0, 8)}`);
-
+        log(`🚀 BUYING ${amount} SOL`);
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
@@ -208,17 +202,8 @@ function startWebSocket() {
             highestMc: mc,
             entryTime: Date.now()
           };
-
           ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
-
-          await sendTelegram(
-            `🚀 <b>ENTRY</b>\n` +
-            `Name: ${name}\n` +
-            `Mint: <code>${mint}</code>\n` +
-            `Spent: <b>${amount} SOL</b>\n` +
-            `MC: $${Math.round(mc)}\n` +
-            `Initial: ${initialBuy.toFixed(2)} SOL`
-          );
+          await sendTelegram(`🚀 <b>ENTRY</b>\n<code>${mint}</code>\n${amount} SOL\nMC $${Math.round(mc)}`);
         }
       }
     } catch (err) {
@@ -226,17 +211,13 @@ function startWebSocket() {
     }
   });
 
-  ws.on('close', () => {
-    log('Reconnecting...');
-    setTimeout(startWebSocket, 4000);
-  });
+  ws.on('close', () => setTimeout(startWebSocket, 4000));
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Mode: Wave Rider (Trailing Stop)`);
-  log(`Trailing activates at +${TRAILING_ACTIVATE}% | Drop allowed: ${TRAILING_DROP}%`);
+  log(`Mode: Wave Rider + Active Price Monitor`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -244,16 +225,10 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  setInterval(async () => {
-    if (activePosition && (Date.now() - activePosition.entryTime) / 1000 > MAX_HOLD_SECONDS) {
-      log('Force closing');
-      const mint = activePosition.mint;
-      activePosition = null;
-      await swap(mint, 0, 'sell');
-    }
-  }, 10000);
+  // Active monitoring every 8 seconds
+  setInterval(checkPosition, 8000);
 
-  await sendTelegram(`⚡ <b>Wave Rider Bot Started</b>\nTrailing after +${TRAILING_ACTIVATE}%\nTP: +${TAKE_PROFIT}%`);
+  await sendTelegram(`⚡ <b>Wave Rider + Monitor Started</b>\nTrailing after +${TRAILING_ACTIVATE}%`);
   startWebSocket();
 }
 
