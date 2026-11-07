@@ -6,12 +6,9 @@ import bs58 from 'bs58';
 const RPC_ENDPOINT = process.env.RPC_ENDPOINT || process.env.RPC_URL;
 const RAW_PRIVATE_KEY = process.env.PRIVATE_KEY || process.env.BOT_PRIVATE_KEY;
 const PUMPPORTAL_API_KEY = process.env.PUMPPORTAL_API_KEY || '';
-const CODEX_API_KEY = process.env.CODEX_API_KEY || '';
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-console.log('=== BOT STARTING ===');
 
 if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
   console.error('Missing RPC_ENDPOINT or PRIVATE_KEY');
@@ -21,11 +18,22 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const MAX_BUY_SOL = 0.17;
+// ====== SETTINGS ======
+const MAX_BUY_SOL = 0.16;
 const SOL_RESERVE = 0.04;
-const MIN_MC = 6000;
-const MAX_MC = 160000;
 
+// Quality filters (to avoid instant dumps)
+const MIN_MC = 8000;              // Avoid micro rugs
+const MAX_MC = 130000;
+const MIN_INITIAL_BUY = 0.45;     // Must have real initial buy volume
+const MIN_NAME_LENGTH = 3;        // Avoid empty/scam names
+
+// Quick profit settings
+const STOP_LOSS = -6.0;
+const TAKE_PROFIT = 24.0;         // Take profit faster
+const MAX_HOLD_SECONDS = 360;     // Max 6 minutes
+
+// State
 let activePosition = null;
 let processed = new Set();
 let isBuying = false;
@@ -50,7 +58,7 @@ async function sendTelegram(msg) {
         disable_web_page_preview: true
       })
     });
-  } catch (e) {}
+  } catch {}
 }
 
 async function getBalance() {
@@ -60,7 +68,7 @@ async function getBalance() {
 
 async function swap(mint, amount, action = 'buy') {
   try {
-    log(`${action.toUpperCase()} ${mint.slice(0, 8)} | ${amount} SOL`);
+    log(`${action.toUpperCase()} → ${mint.slice(0, 8)} | ${amount} SOL`);
 
     const res = await fetch('https://pumpportal.fun/api/trade-local', {
       method: 'POST',
@@ -71,8 +79,8 @@ async function swap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: 50,
-        priorityFee: 0.01,
+        slippage: 48,
+        priorityFee: 0.011,
         pool: 'auto'
       })
     });
@@ -82,26 +90,29 @@ async function swap(mint, amount, action = 'buy') {
     const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
     tx.sign([wallet]);
 
-    const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 4 });
-    log(`SUCCESS ${action}: ${txid}`);
+    const txid = await connection.sendTransaction(tx, {
+      skipPreflight: true,
+      maxRetries: 5
+    });
+
+    log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
     return txid;
   } catch (err) {
-    log(`FAILED ${action}: ${err.message}`);
+    log(`❌ ${action.toUpperCase()} FAILED: ${err.message}`);
     return null;
   }
 }
 
-// ====================== PUMPPORTAL ======================
-function startPumpPortal() {
+// ====================== WEBSOCKET ======================
+function startWebSocket() {
   const url = PUMPPORTAL_API_KEY
     ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
     : `wss://pumpportal.fun/api/data`;
 
-  log('Starting PumpPortal...');
   const ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('PumpPortal connected');
+    log('🟢 Connected – Quality + Quick Profit Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -111,9 +122,8 @@ function startPumpPortal() {
       if (!event.mint) return;
 
       const mint = event.mint;
-      const isNew = !!(event.name || event.symbol || event.initialBuy);
 
-      // Exit check
+      // ========== EXIT ==========
       if (activePosition && mint === activePosition.mint) {
         let mc = 0;
         if (event.marketCapSol) mc = event.marketCapSol * solPrice;
@@ -121,64 +131,100 @@ function startPumpPortal() {
 
         if (mc > 0) {
           const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
-          if (pnl <= -7 || pnl >= 28) {
-            log(`EXIT ${mint.slice(0, 8)} | PnL ${pnl.toFixed(1)}%`);
-            const old = activePosition.mint;
+          const held = (Date.now() - activePosition.entryTime) / 1000;
+
+          let reason = null;
+          if (pnl <= STOP_LOSS) reason = `Stop-Loss ${pnl.toFixed(1)}%`;
+          else if (pnl >= TAKE_PROFIT) reason = `Take-Profit +${pnl.toFixed(1)}%`;
+          else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
+
+          if (reason) {
+            log(`🔴 EXIT ${mint.slice(0, 8)} | ${reason}`);
+            const oldMint = activePosition.mint;
             activePosition = null;
-            await swap(old, 0, 'sell');
-            await sendTelegram(`Closed ${old.slice(0, 8)} | PnL ${pnl.toFixed(1)}%`);
+            await swap(oldMint, 0, 'sell');
+            await sendTelegram(`🔴 Closed <code>${oldMint.slice(0, 8)}</code>\n${reason}`);
           }
         }
         return;
       }
 
+      // ========== ENTRY ==========
+      const isNew = !!(event.name || event.symbol || event.initialBuy || event.txType === 'create');
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
+      const name = (event.name || event.symbol || '').trim();
       let mc = 0;
       if (event.marketCapSol) mc = event.marketCapSol * solPrice;
       else if (event.marketCapUsd) mc = event.marketCapUsd;
+      else if (event.usd_market_cap) mc = event.usd_market_cap;
 
       let initialBuy = 0;
       if (event.initialBuy) {
         initialBuy = event.initialBuy > 1e6 ? event.initialBuy / 1e9 : event.initialBuy;
+      } else if (event.solAmount) {
+        initialBuy = event.solAmount > 1e6 ? event.solAmount / 1e9 : event.solAmount;
       }
 
-      log(`New token: ${mint.slice(0, 8)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+      log(`New: ${mint.slice(0, 8)} | ${name} | MC $${Math.round(mc)} | InitBuy ${initialBuy.toFixed(2)}`);
 
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= 0.25) {
+      // Quality filters to avoid instant dumps
+      if (
+        mc >= MIN_MC &&
+        mc <= MAX_MC &&
+        initialBuy >= MIN_INITIAL_BUY &&
+        name.length >= MIN_NAME_LENGTH
+      ) {
         processed.add(mint);
+
         const amount = Math.min(await getBalance(), MAX_BUY_SOL);
         if (amount < 0.06) return;
 
         isBuying = true;
-        log(`BUYING ${amount} SOL`);
+        log(`🚀 QUALITY ENTRY → ${amount} SOL`);
+
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
         if (tx) {
-          activePosition = { mint, entryMc: mc, entryTime: Date.now() };
-          await sendTelegram(`BOUGHT ${mint.slice(0, 8)}\n${amount} SOL\nMC $${Math.round(mc)}`);
+          activePosition = {
+            mint,
+            entryMc: mc,
+            entryTime: Date.now()
+          };
+
+          // Try to get updates
+          ws.send(JSON.stringify({ method: 'subscribeTokenTrade', keys: [mint] }));
+
+          await sendTelegram(
+            `🚀 <b>QUALITY ENTRY</b>\n` +
+            `Name: ${name}\n` +
+            `Mint: <code>${mint}</code>\n` +
+            `Spent: <b>${amount} SOL</b>\n` +
+            `MC: $${Math.round(mc)}\n` +
+            `Initial Buy: ${initialBuy.toFixed(2)} SOL\n` +
+            `<a href="https://solscan.io/tx/${tx}">Tx</a>`
+          );
         }
       }
     } catch (err) {
-      log(`PumpPortal error: ${err.message}`);
+      log(`Error: ${err.message}`);
     }
   });
 
   ws.on('close', () => {
-    log('PumpPortal closed – reconnecting');
-    setTimeout(startPumpPortal, 4000);
+    log('Reconnecting in 4s...');
+    setTimeout(startWebSocket, 4000);
   });
 
-  ws.on('error', (err) => log(`PumpPortal error: ${err.message}`));
+  ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`RPC: ${RPC_ENDPOINT.slice(0, 50)}...`);
-  log(`Codex Key: ${CODEX_API_KEY ? 'Yes' : 'No'}`);
-  log(`PumpPortal Key: ${PUMPPORTAL_API_KEY ? 'Yes' : 'No'}`);
+  log(`Mode: Quality + Quick Profit`);
+  log(`Min MC: $${MIN_MC} | Min InitBuy: ${MIN_INITIAL_BUY} SOL`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -186,14 +232,18 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  await sendTelegram('Bot started – Hybrid (PumpPortal focus)');
-  startPumpPortal();
+  // Safety force close
+  setInterval(async () => {
+    if (activePosition && (Date.now() - activePosition.entryTime) / 1000 > MAX_HOLD_SECONDS) {
+      log('Force closing old position');
+      const mint = activePosition.mint;
+      activePosition = null;
+      await swap(mint, 0, 'sell');
+    }
+  }, 10000);
 
-  // Note: Codex is temporarily disabled until we confirm the plan supports WebSockets
-  log('Codex temporarily disabled (plan may not support subscriptions)');
+  await sendTelegram(`⚡ <b>Quality Sniper Started</b>\nMin InitBuy: ${MIN_INITIAL_BUY} SOL\nFast TP: +${TAKE_PROFIT}%`);
+  startWebSocket();
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+main();
