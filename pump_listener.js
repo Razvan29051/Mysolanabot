@@ -18,21 +18,20 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== STRATEGY SETTINGS ======
-const BASE_INVEST_PERCENT = 0.25;      // Base 25%
+// ====== STRATEGY ======
+const BASE_INVEST_PERCENT = 0.25;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 3800;
+const MIN_MC = 4000;
 const MAX_MC = 150000;
-const MIN_INITIAL_BUY = 0.32;
+const MIN_INITIAL_BUY = 0.40;          // <-- Recommended for real buy power
 
 const HARD_STOP_LOSS = -7.0;
-const TRAILING_ACTIVATE = 8.0;
-const TRAILING_DROP = -4.8;
-const TAKE_PROFIT = 24.0;
-const MAX_HOLD_SECONDS = 240;
+const TRAILING_ACTIVATE = 9.0;
+const TRAILING_DROP = -5.0;
+const TAKE_PROFIT = 28.0;
+const MAX_HOLD_SECONDS = 270;
 
-// State
 let activePosition = null;
 let processed = new Set();
 let isBuying = false;
@@ -40,7 +39,6 @@ let solPrice = 180;
 let lastBuyTime = 0;
 let ws = null;
 
-// Performance tracking
 let wins = 0;
 let losses = 0;
 let consecutiveLosses = 0;
@@ -82,14 +80,9 @@ async function getAvailableToTrade() {
   return Math.max(0, Number((real - SOL_RESERVE).toFixed(4)));
 }
 
-// Adaptive position size based on performance
 function getInvestPercent() {
-  if (consecutiveLosses >= 3) return 0.12;          // Play small after 3 losses
-  if (consecutiveLosses === 2) return 0.18;
-  if (wins + losses >= 5) {
-    const winRate = wins / (wins + losses);
-    if (winRate < 0.4) return 0.15;
-  }
+  if (consecutiveLosses >= 3) return 0.12;
+  if (consecutiveLosses === 2) return 0.17;
   return BASE_INVEST_PERCENT;
 }
 
@@ -180,7 +173,6 @@ async function checkPosition() {
     const tx = await swap(mint, 0, 'sell');
 
     if (tx) {
-      // Update stats
       if (pnl >= 0) {
         wins++;
         consecutiveLosses = 0;
@@ -191,11 +183,7 @@ async function checkPosition() {
       }
 
       await sendTelegram(
-        `🔴 <b>Closed</b>\n` +
-        `<code>${mint.slice(0, 8)}</code>\n` +
-        `${reason}\n` +
-        `Spent: ${spent} SOL\n` +
-        `Record: ${wins}W / ${losses}L`
+        `🔴 <b>Closed</b>\n<code>${mint.slice(0, 8)}</code>\n${reason}\nSpent: ${spent} SOL\nRecord: ${wins}W/${losses}L`
       );
     } else {
       await sendTelegram(`⚠️ SELL FAILED: <code>${mint.slice(0, 8)}</code>`);
@@ -214,7 +202,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Smart Mode');
+    log('🟢 Connected – Buy Power Mode (0.40)');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -227,9 +215,8 @@ function startWebSocket() {
       const isNew = !!(event.name || event.symbol || event.initialBuy);
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
-      // Cooldown after big losses
-      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 90000) return;
-      if (Date.now() - lastBuyTime < 20000) return;
+      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 80000) return;
+      if (Date.now() - lastBuyTime < 22000) return;
 
       const name = (event.name || event.symbol || '').trim();
 
@@ -250,7 +237,7 @@ function startWebSocket() {
         const investPct = getInvestPercent();
         const amount = Number((available * investPct).toFixed(4));
 
-        log(`Balance available: ${available} | Investing ${amount} SOL (${(investPct*100).toFixed(0)}%)`);
+        log(`Available: ${available} SOL | Investing: ${amount} SOL`);
 
         if (amount < 0.045) return;
 
@@ -271,11 +258,7 @@ function startWebSocket() {
           };
 
           await sendTelegram(
-            `🚀 <b>ENTRY</b>\n` +
-            `<code>${mint}</code>\n` +
-            `Spent: <b>${amount} SOL</b>\n` +
-            `MC: $${Math.round(mc)}\n` +
-            `Init: ${initialBuy.toFixed(2)} | Record: ${wins}W/${losses}L`
+            `🚀 <b>ENTRY</b>\n<code>${mint}</code>\nSpent: <b>${amount} SOL</b>\nMC: $${Math.round(mc)}\nInit Buy: ${initialBuy.toFixed(2)} SOL`
           );
         }
       }
@@ -292,7 +275,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | Smart position sizing active`);
+  log(`Balance: ${bal} SOL | Min InitBuy: ${MIN_INITIAL_BUY}`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -302,7 +285,7 @@ async function main() {
 
   setInterval(checkPosition, 5500);
 
-  await sendTelegram(`⚡ <b>Smart Bot Started</b>\n• Adaptive sizing\n• Faster TP\n• Loss protection\n• Real balance check`);
+  await sendTelegram(`⚡ <b>Bot Updated</b>\nMin InitBuy: 0.40 SOL\nFocus on real buy power + wave riding`);
   startWebSocket();
 }
 
