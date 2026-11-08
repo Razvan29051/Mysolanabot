@@ -18,11 +18,9 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
-
 // Settings
-const INVEST_PERCENT = 0.30;
-const SOL_RESERVE = 0.04;
+const INVEST_PERCENT = 0.30;          // 30% of available balance
+const SOL_RESERVE = 0.035;
 
 const MIN_MC = 4000;
 const MAX_MC = 160000;
@@ -73,9 +71,10 @@ async function getAvailableBalance() {
   return Math.max(0, Number((bal - SOL_RESERVE).toFixed(4)));
 }
 
-// ====================== SWAP FUNCTIONS ======================
-async function pumpSwap(mint, amount, action = 'buy') {
+// ====================== SWAP ======================
+async function swap(mint, amount, action = 'buy') {
   const maxRetries = 3;
+
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
       log(`${action.toUpperCase()} attempt ${attempt} → ${mint.slice(0, 8)}`);
@@ -102,79 +101,26 @@ async function pumpSwap(mint, amount, action = 'buy') {
       const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
       tx.sign([wallet]);
 
-      const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 4 });
-      await new Promise(r => setTimeout(r, 3000));
+      const txid = await connection.sendTransaction(tx, {
+        skipPreflight: true,
+        maxRetries: 4
+      });
 
+      await new Promise(r => setTimeout(r, 3000));
       const status = await connection.getSignatureStatus(txid);
+
       if (status?.value?.err) throw new Error('On-chain error');
 
       log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
       return txid;
+
     } catch (err) {
       log(`❌ ${action} attempt ${attempt} failed: ${err.message}`);
       if (attempt === maxRetries) return null;
-      await new Promise(r => setTimeout(r, 1600));
+      await new Promise(r => setTimeout(r, 1500));
     }
   }
   return null;
-}
-
-// More reliable SOL → USDC
-async function swapSolToUsdc(solAmount) {
-  if (solAmount < 0.03) {
-    log('Amount too small to convert');
-    return null;
-  }
-
-  try {
-    log(`Converting ${solAmount.toFixed(4)} SOL → USDC...`);
-
-    const amountInLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
-
-    // Get quote
-    const quoteRes = await fetch(
-      `https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MINT}&amount=${amountInLamports}&slippageBps=150`
-    );
-
-    if (!quoteRes.ok) throw new Error(`Quote failed: ${quoteRes.status}`);
-
-    const quote = await quoteRes.json();
-    if (!quote || quote.error || !quote.outAmount) throw new Error('Invalid quote');
-
-    // Get swap transaction
-    const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        quoteResponse: quote,
-        userPublicKey: wallet.publicKey.toString(),
-        wrapAndUnwrapSol: true,
-        prioritizationFeeLamports: 'auto',
-        dynamicComputeUnitLimit: true
-      })
-    });
-
-    if (!swapRes.ok) throw new Error(`Swap failed: ${swapRes.status}`);
-
-    const swapData = await swapRes.json();
-    if (!swapData.swapTransaction) throw new Error('No swapTransaction returned');
-
-    const swapTxBuf = Buffer.from(swapData.swapTransaction, 'base64');
-    const tx = VersionedTransaction.deserialize(swapTxBuf);
-    tx.sign([wallet]);
-
-    const txid = await connection.sendTransaction(tx, {
-      skipPreflight: true,
-      maxRetries: 3
-    });
-
-    log(`✅ SOL → USDC SUCCESS: ${txid}`);
-    return txid;
-
-  } catch (err) {
-    log(`❌ USDC conversion failed: ${err.message}`);
-    return null;
-  }
 }
 
 async function getCurrentMc(mint) {
@@ -219,30 +165,23 @@ async function checkPosition() {
 
     activePosition = null;
 
-    const sellTx = await pumpSwap(mint, 0, 'sell');
+    const sellTx = await swap(mint, 0, 'sell');
 
     if (sellTx) {
-      await new Promise(r => setTimeout(r, 6000)); // wait for balance update
+      await new Promise(r => setTimeout(r, 5000));
       const balanceAfter = await getSolBalance();
       const solProfit = balanceAfter - (balanceBefore - spentSol);
       const usdProfit = solProfit * solPrice;
-
-      // Try convert to USDC
-      const convertAmount = Math.max(0, balanceAfter - SOL_RESERVE - 0.02);
-      const convertTx = await swapSolToUsdc(convertAmount);
-
-      let convertMsg = convertTx ? '✅ Converted to USDC' : '⚠️ Kept in SOL (conversion failed)';
 
       await sendTelegram(
         `🔴 <b>Closed</b> <code>${mint.slice(0, 8)}</code>\n` +
         `Reason: ${reason}\n` +
         `Spent: ${spentSol.toFixed(4)} SOL\n` +
         `SOL Profit: <b>${solProfit >= 0 ? '+' : ''}${solProfit.toFixed(4)} SOL</b>\n` +
-        `Est. USD: <b>$${usdProfit.toFixed(2)}</b>\n` +
-        `${convertMsg}`
+        `Est. USD: <b>$${usdProfit.toFixed(2)}</b>`
       );
     } else {
-      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nSell manually!`);
+      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nPlease sell manually!`);
     }
   }
 }
@@ -261,7 +200,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected');
+    log('🟢 Connected – Clean SOL Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -299,8 +238,8 @@ function startWebSocket() {
         if (amount < 0.05) return;
 
         isBuying = true;
-        log(`🚀 BUYING ${amount} SOL`);
-        const tx = await pumpSwap(mint, amount, 'buy');
+        log(`🚀 BUYING ${amount} SOL (30%)`);
+        const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
         if (tx) {
@@ -317,7 +256,8 @@ function startWebSocket() {
             `🚀 <b>ENTRY</b>\n` +
             `<code>${mint}</code>\n` +
             `Spent: <b>${amount} SOL</b> (≈ $${(amount * solPrice).toFixed(2)})\n` +
-            `MC: $${Math.round(mc)}`
+            `MC: $${Math.round(mc)}\n` +
+            `Init: ${initialBuy.toFixed(2)} SOL`
           );
         }
       }
@@ -326,14 +266,18 @@ function startWebSocket() {
     }
   });
 
-  ws.on('close', () => setTimeout(startWebSocket, 5000));
+  ws.on('close', () => {
+    log('Reconnecting in 5s...');
+    setTimeout(startWebSocket, 5000);
+  });
+
   ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Mode: Safer profit + better USDC conversion`);
+  log(`Clean Mode → 30% balance | No USDC conversion`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -343,7 +287,7 @@ async function main() {
 
   setInterval(checkPosition, 7000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nImproved USDC conversion + real SOL profit tracking`);
+  await sendTelegram(`⚡ <b>Bot Updated</b>\n• Invests 30% of balance\n• Stays in SOL (no conversion)\n• Safer profit tracking`);
   startWebSocket();
 }
 
