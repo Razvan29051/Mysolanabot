@@ -19,8 +19,8 @@ const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
 // Settings
-const INVEST_PERCENT = 0.30;          // 30% of available balance
-const SOL_RESERVE = 0.035;
+const INVEST_PERCENT = 0.30;        // 30% of real available balance
+const SOL_RESERVE = 0.04;           // Keep for fees
 
 const MIN_MC = 4000;
 const MAX_MC = 160000;
@@ -61,14 +61,22 @@ async function sendTelegram(msg) {
   } catch {}
 }
 
-async function getSolBalance() {
-  const bal = await connection.getBalance(wallet.publicKey);
-  return Number((bal / LAMPORTS_PER_SOL).toFixed(4));
+// Fresh balance check every time
+async function getRealBalance() {
+  try {
+    const bal = await connection.getBalance(wallet.publicKey, 'confirmed');
+    const sol = bal / LAMPORTS_PER_SOL;
+    return Number(sol.toFixed(4));
+  } catch (err) {
+    log(`Balance check error: ${err.message}`);
+    return 0;
+  }
 }
 
-async function getAvailableBalance() {
-  const bal = await getSolBalance();
-  return Math.max(0, Number((bal - SOL_RESERVE).toFixed(4)));
+async function getAvailableToTrade() {
+  const realBalance = await getRealBalance();
+  const available = realBalance - SOL_RESERVE;
+  return Math.max(0, Number(available.toFixed(4)));
 }
 
 // ====================== SWAP ======================
@@ -77,7 +85,7 @@ async function swap(mint, amount, action = 'buy') {
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
-      log(`${action.toUpperCase()} attempt ${attempt} → ${mint.slice(0, 8)}`);
+      log(`${action.toUpperCase()} attempt ${attempt} → ${mint.slice(0, 8)} | Amount: ${amount}`);
 
       const body = {
         publicKey: wallet.publicKey.toString(),
@@ -161,27 +169,19 @@ async function checkPosition() {
 
     const mint = activePosition.mint;
     const spentSol = activePosition.spentSol;
-    const balanceBefore = await getSolBalance();
 
     activePosition = null;
 
     const sellTx = await swap(mint, 0, 'sell');
 
     if (sellTx) {
-      await new Promise(r => setTimeout(r, 5000));
-      const balanceAfter = await getSolBalance();
-      const solProfit = balanceAfter - (balanceBefore - spentSol);
-      const usdProfit = solProfit * solPrice;
-
       await sendTelegram(
         `🔴 <b>Closed</b> <code>${mint.slice(0, 8)}</code>\n` +
         `Reason: ${reason}\n` +
-        `Spent: ${spentSol.toFixed(4)} SOL\n` +
-        `SOL Profit: <b>${solProfit >= 0 ? '+' : ''}${solProfit.toFixed(4)} SOL</b>\n` +
-        `Est. USD: <b>$${usdProfit.toFixed(2)}</b>`
+        `Spent: ${spentSol.toFixed(4)} SOL`
       );
     } else {
-      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nPlease sell manually!`);
+      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nSell manually!`);
     }
   }
 }
@@ -200,7 +200,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Clean SOL Mode');
+    log('🟢 Connected – Real Balance Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -230,15 +230,23 @@ function startWebSocket() {
       log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 14)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
       if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
-        processed.add(mint);
-
-        const available = await getAvailableBalance();
+        
+        // === REAL BALANCE CHECK ===
+        const realBalance = await getRealBalance();
+        const available = await getAvailableToTrade();
         const amount = Number((available * INVEST_PERCENT).toFixed(4));
 
-        if (amount < 0.05) return;
+        log(`Wallet Balance: ${realBalance} SOL | Available: ${available} SOL | Will invest: ${amount} SOL`);
 
+        if (amount < 0.05) {
+          log(`Skipping – amount too low (${amount} SOL)`);
+          return;
+        }
+
+        processed.add(mint);
         isBuying = true;
-        log(`🚀 BUYING ${amount} SOL (30%)`);
+
+        log(`🚀 BUYING ${amount} SOL`);
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
@@ -255,9 +263,9 @@ function startWebSocket() {
           await sendTelegram(
             `🚀 <b>ENTRY</b>\n` +
             `<code>${mint}</code>\n` +
-            `Spent: <b>${amount} SOL</b> (≈ $${(amount * solPrice).toFixed(2)})\n` +
-            `MC: $${Math.round(mc)}\n` +
-            `Init: ${initialBuy.toFixed(2)} SOL`
+            `Spent: <b>${amount} SOL</b>\n` +
+            `Wallet had: ${realBalance} SOL\n` +
+            `MC: $${Math.round(mc)}`
           );
         }
       }
@@ -277,7 +285,10 @@ function startWebSocket() {
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Clean Mode → 30% balance | No USDC conversion`);
+  
+  const startBalance = await getRealBalance();
+  log(`Starting Balance: ${startBalance} SOL`);
+  log(`Will invest 30% of available balance each trade`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -287,7 +298,7 @@ async function main() {
 
   setInterval(checkPosition, 7000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\n• Invests 30% of balance\n• Stays in SOL (no conversion)\n• Safer profit tracking`);
+  await sendTelegram(`⚡ <b>Bot Started</b>\nReal balance checking enabled\nInvesting 30% of available SOL`);
   startWebSocket();
 }
 
