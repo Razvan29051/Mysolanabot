@@ -18,27 +18,33 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== SETTINGS ======
-const INVEST_PERCENT = 0.25;          // 25% of available balance
+// ====== STRATEGY SETTINGS ======
+const BASE_INVEST_PERCENT = 0.25;      // Base 25%
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 4000;
-const MAX_MC = 160000;
-const MIN_INITIAL_BUY = 0.35;         // As you requested
+const MIN_MC = 3800;
+const MAX_MC = 150000;
+const MIN_INITIAL_BUY = 0.32;
 
-// Faster profit taking
-const HARD_STOP_LOSS = -7.5;
-const TRAILING_ACTIVATE = 9.0;        // Start trailing earlier
-const TRAILING_DROP = -5.0;           // Tighter trail
-const TAKE_PROFIT = 26.0;             // Quicker TP
-const MAX_HOLD_SECONDS = 280;         // Don't hold too long
+const HARD_STOP_LOSS = -7.0;
+const TRAILING_ACTIVATE = 8.0;
+const TRAILING_DROP = -4.8;
+const TAKE_PROFIT = 24.0;
+const MAX_HOLD_SECONDS = 240;
 
+// State
 let activePosition = null;
 let processed = new Set();
 let isBuying = false;
 let solPrice = 180;
 let lastBuyTime = 0;
 let ws = null;
+
+// Performance tracking
+let wins = 0;
+let losses = 0;
+let consecutiveLosses = 0;
+let lastLossTime = 0;
 
 // ====================== HELPERS ======================
 function log(msg) {
@@ -66,24 +72,32 @@ async function getRealBalance() {
   try {
     const bal = await connection.getBalance(wallet.publicKey, 'confirmed');
     return Number((bal / LAMPORTS_PER_SOL).toFixed(4));
-  } catch (err) {
-    log(`Balance error: ${err.message}`);
+  } catch {
     return 0;
   }
 }
 
 async function getAvailableToTrade() {
-  const realBalance = await getRealBalance();
-  return Math.max(0, Number((realBalance - SOL_RESERVE).toFixed(4)));
+  const real = await getRealBalance();
+  return Math.max(0, Number((real - SOL_RESERVE).toFixed(4)));
+}
+
+// Adaptive position size based on performance
+function getInvestPercent() {
+  if (consecutiveLosses >= 3) return 0.12;          // Play small after 3 losses
+  if (consecutiveLosses === 2) return 0.18;
+  if (wins + losses >= 5) {
+    const winRate = wins / (wins + losses);
+    if (winRate < 0.4) return 0.15;
+  }
+  return BASE_INVEST_PERCENT;
 }
 
 // ====================== SWAP ======================
 async function swap(mint, amount, action = 'buy') {
-  const maxRetries = 3;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      log(`${action.toUpperCase()} attempt ${attempt} → ${mint.slice(0, 8)} | ${amount}`);
+      log(`${action.toUpperCase()} #${attempt} → ${mint.slice(0, 8)} | ${amount}`);
 
       const body = {
         publicKey: wallet.publicKey.toString(),
@@ -91,8 +105,8 @@ async function swap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: action === 'sell' ? 60 : 50,
-        priorityFee: action === 'sell' ? 0.015 : 0.012,
+        slippage: action === 'sell' ? 65 : 50,
+        priorityFee: action === 'sell' ? 0.018 : 0.013,
         pool: 'auto'
       };
 
@@ -107,23 +121,18 @@ async function swap(mint, amount, action = 'buy') {
       const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
       tx.sign([wallet]);
 
-      const txid = await connection.sendTransaction(tx, {
-        skipPreflight: true,
-        maxRetries: 4
-      });
+      const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 4 });
+      await new Promise(r => setTimeout(r, 2800));
 
-      await new Promise(r => setTimeout(r, 3000));
       const status = await connection.getSignatureStatus(txid);
+      if (status?.value?.err) throw new Error('On-chain fail');
 
-      if (status?.value?.err) throw new Error('On-chain error');
-
-      log(`✅ ${action.toUpperCase()} SUCCESS: ${txid}`);
+      log(`✅ ${action.toUpperCase()} SUCCESS`);
       return txid;
-
     } catch (err) {
-      log(`❌ ${action} attempt ${attempt} failed: ${err.message}`);
-      if (attempt === maxRetries) return null;
-      await new Promise(r => setTimeout(r, 1500));
+      log(`❌ ${action} failed: ${err.message}`);
+      if (attempt === 3) return null;
+      await new Promise(r => setTimeout(r, 1400));
     }
   }
   return null;
@@ -133,7 +142,7 @@ async function getCurrentMc(mint) {
   try {
     const res = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
     const data = await res.json();
-    if (data.pairs && data.pairs.length > 0) {
+    if (data.pairs?.length > 0) {
       const pair = data.pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
       return parseFloat(pair.marketCap || pair.fdv || 0);
     }
@@ -150,55 +159,62 @@ async function checkPosition() {
 
   if (mc > activePosition.highestMc) activePosition.highestMc = mc;
 
-  const pnlPercent = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
-  const dropFromHigh = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
+  const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
+  const drop = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
   const held = (Date.now() - activePosition.entryTime) / 1000;
 
-  log(`Monitor → PnL ${pnlPercent.toFixed(1)}% | Drop ${dropFromHigh.toFixed(1)}%`);
+  log(`Monitor → PnL ${pnl.toFixed(1)}% | Drop ${drop.toFixed(1)}%`);
 
   let reason = null;
-  if (pnlPercent <= HARD_STOP_LOSS) reason = `Hard SL`;
-  else if (pnlPercent >= TRAILING_ACTIVATE && dropFromHigh <= TRAILING_DROP) reason = `Trailing Stop`;
-  else if (pnlPercent >= TAKE_PROFIT) reason = `Take-Profit`;
+  if (pnl <= HARD_STOP_LOSS) reason = `Hard SL (${pnl.toFixed(1)}%)`;
+  else if (pnl >= TRAILING_ACTIVATE && drop <= TRAILING_DROP) reason = `Trailing (${drop.toFixed(1)}%)`;
+  else if (pnl >= TAKE_PROFIT) reason = `Take-Profit (+${pnl.toFixed(1)}%)`;
   else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
 
   if (reason) {
-    log(`🔴 EXIT ${activePosition.mint.slice(0, 8)} | ${reason}`);
-
+    log(`🔴 EXIT → ${reason}`);
     const mint = activePosition.mint;
-    const spentSol = activePosition.spentSol;
-
+    const spent = activePosition.spentSol;
     activePosition = null;
 
-    const sellTx = await swap(mint, 0, 'sell');
+    const tx = await swap(mint, 0, 'sell');
 
-    if (sellTx) {
+    if (tx) {
+      // Update stats
+      if (pnl >= 0) {
+        wins++;
+        consecutiveLosses = 0;
+      } else {
+        losses++;
+        consecutiveLosses++;
+        lastLossTime = Date.now();
+      }
+
       await sendTelegram(
-        `🔴 <b>Closed</b> <code>${mint.slice(0, 8)}</code>\n` +
-        `Reason: ${reason}\n` +
-        `Spent: ${spentSol.toFixed(4)} SOL`
+        `🔴 <b>Closed</b>\n` +
+        `<code>${mint.slice(0, 8)}</code>\n` +
+        `${reason}\n` +
+        `Spent: ${spent} SOL\n` +
+        `Record: ${wins}W / ${losses}L`
       );
     } else {
-      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nSell manually!`);
+      await sendTelegram(`⚠️ SELL FAILED: <code>${mint.slice(0, 8)}</code>`);
     }
   }
 }
 
 // ====================== WEBSOCKET ======================
 function startWebSocket() {
-  if (ws) {
-    try { ws.terminate(); } catch {}
-  }
+  if (ws) try { ws.terminate(); } catch {}
 
   const url = PUMPPORTAL_API_KEY
     ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
     : `wss://pumpportal.fun/api/data`;
 
-  log('Connecting...');
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Fast Profit Mode');
+    log('🟢 Connected – Smart Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -209,11 +225,11 @@ function startWebSocket() {
 
       const mint = event.mint;
       const isNew = !!(event.name || event.symbol || event.initialBuy);
-
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
-      
-      // Shorter cooldown
-      if (Date.now() - lastBuyTime < 25000) return;
+
+      // Cooldown after big losses
+      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 90000) return;
+      if (Date.now() - lastBuyTime < 20000) return;
 
       const name = (event.name || event.symbol || '').trim();
 
@@ -227,22 +243,20 @@ function startWebSocket() {
       }
       if (initialBuy > 50) initialBuy = initialBuy / 1e9;
 
-      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 14)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 13)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
       if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
-        
-        const realBalance = await getRealBalance();
         const available = await getAvailableToTrade();
-        const amount = Number((available * INVEST_PERCENT).toFixed(4));
+        const investPct = getInvestPercent();
+        const amount = Number((available * investPct).toFixed(4));
 
-        log(`Balance: ${realBalance} SOL | Investing: ${amount} SOL`);
+        log(`Balance available: ${available} | Investing ${amount} SOL (${(investPct*100).toFixed(0)}%)`);
 
-        if (amount < 0.05) return;
+        if (amount < 0.045) return;
 
         processed.add(mint);
         isBuying = true;
 
-        log(`🚀 BUYING ${amount} SOL`);
         const tx = await swap(mint, amount, 'buy');
         isBuying = false;
 
@@ -261,7 +275,7 @@ function startWebSocket() {
             `<code>${mint}</code>\n` +
             `Spent: <b>${amount} SOL</b>\n` +
             `MC: $${Math.round(mc)}\n` +
-            `Init: ${initialBuy.toFixed(2)} SOL`
+            `Init: ${initialBuy.toFixed(2)} | Record: ${wins}W/${losses}L`
           );
         }
       }
@@ -270,21 +284,15 @@ function startWebSocket() {
     }
   });
 
-  ws.on('close', () => {
-    log('Reconnecting in 5s...');
-    setTimeout(startWebSocket, 5000);
-  });
-
+  ws.on('close', () => setTimeout(startWebSocket, 5000));
   ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Mode: InitBuy 0.35 | Fast TP | 25% balance`);
-
-  const startBalance = await getRealBalance();
-  log(`Starting Balance: ${startBalance} SOL`);
+  const bal = await getRealBalance();
+  log(`Balance: ${bal} SOL | Smart position sizing active`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -292,9 +300,9 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  setInterval(checkPosition, 6000);
+  setInterval(checkPosition, 5500);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nMin InitBuy: 0.35 SOL\nFaster take-profit\n25% of balance`);
+  await sendTelegram(`⚡ <b>Smart Bot Started</b>\n• Adaptive sizing\n• Faster TP\n• Loss protection\n• Real balance check`);
   startWebSocket();
 }
 
