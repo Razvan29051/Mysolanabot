@@ -18,8 +18,7 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// USDC mint on Solana
-const USDC_MINT = new PublicKey('EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v');
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
 // Settings
 const INVEST_PERCENT = 0.30;
@@ -64,13 +63,17 @@ async function sendTelegram(msg) {
   } catch {}
 }
 
-async function getAvailableBalance() {
+async function getSolBalance() {
   const bal = await connection.getBalance(wallet.publicKey);
-  const available = (bal / LAMPORTS_PER_SOL) - SOL_RESERVE;
-  return Math.max(0, Number(available.toFixed(4)));
+  return Number((bal / LAMPORTS_PER_SOL).toFixed(4));
 }
 
-// ====================== SWAP FUNCTIONS ======================
+async function getAvailableBalance() {
+  const bal = await getSolBalance();
+  return Math.max(0, Number((bal - SOL_RESERVE).toFixed(4)));
+}
+
+// ====================== SWAP ======================
 async function pumpSwap(mint, amount, action = 'buy') {
   const maxRetries = 3;
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -100,7 +103,7 @@ async function pumpSwap(mint, amount, action = 'buy') {
       tx.sign([wallet]);
 
       const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 4 });
-      await new Promise(r => setTimeout(r, 2500));
+      await new Promise(r => setTimeout(r, 3000));
 
       const status = await connection.getSignatureStatus(txid);
       if (status?.value?.err) throw new Error('On-chain error');
@@ -116,22 +119,18 @@ async function pumpSwap(mint, amount, action = 'buy') {
   return null;
 }
 
-// Convert SOL → USDC using Jupiter
 async function swapSolToUsdc(solAmount) {
   try {
-    if (solAmount < 0.01) return null;
+    if (solAmount < 0.02) return null;
+    log(`Converting ${solAmount.toFixed(4)} SOL → USDC...`);
 
-    log(`Converting ${solAmount} SOL → USDC...`);
-
-    // Get quote from Jupiter
-    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MINT.toString()}&amount=${Math.floor(solAmount * LAMPORTS_PER_SOL)}&slippageBps=100`;
+    const amountLamports = Math.floor(solAmount * LAMPORTS_PER_SOL);
+    const quoteUrl = `https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${USDC_MINT}&amount=${amountLamports}&slippageBps=100`;
     
     const quoteRes = await fetch(quoteUrl);
     const quote = await quoteRes.json();
+    if (!quote || quote.error) throw new Error('No quote');
 
-    if (!quote || quote.error) throw new Error('No Jupiter quote');
-
-    // Get swap transaction
     const swapRes = await fetch('https://quote-api.jup.ag/v6/swap', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -144,16 +143,16 @@ async function swapSolToUsdc(solAmount) {
     });
 
     const swapData = await swapRes.json();
-    if (!swapData.swapTransaction) throw new Error('No swap transaction');
+    if (!swapData.swapTransaction) throw new Error('No swap tx');
 
     const tx = VersionedTransaction.deserialize(Buffer.from(swapData.swapTransaction, 'base64'));
     tx.sign([wallet]);
 
     const txid = await connection.sendTransaction(tx, { skipPreflight: true });
-    log(`✅ SOL → USDC SUCCESS: ${txid}`);
+    log(`✅ Converted to USDC: ${txid}`);
     return txid;
   } catch (err) {
-    log(`❌ SOL → USDC failed: ${err.message}`);
+    log(`❌ USDC conversion failed: ${err.message}`);
     return null;
   }
 }
@@ -186,38 +185,45 @@ async function checkPosition() {
   log(`Monitor → PnL ${pnlPercent.toFixed(1)}% | Drop ${dropFromHigh.toFixed(1)}%`);
 
   let reason = null;
-  if (pnlPercent <= HARD_STOP_LOSS) reason = `Hard SL ${pnlPercent.toFixed(1)}%`;
-  else if (pnlPercent >= TRAILING_ACTIVATE && dropFromHigh <= TRAILING_DROP) reason = `Trailing ${dropFromHigh.toFixed(1)}%`;
-  else if (pnlPercent >= TAKE_PROFIT) reason = `Take-Profit +${pnlPercent.toFixed(1)}%`;
+  if (pnlPercent <= HARD_STOP_LOSS) reason = `Hard SL`;
+  else if (pnlPercent >= TRAILING_ACTIVATE && dropFromHigh <= TRAILING_DROP) reason = `Trailing Stop`;
+  else if (pnlPercent >= TAKE_PROFIT) reason = `Take-Profit`;
   else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
 
   if (reason) {
     log(`🔴 EXIT ${activePosition.mint.slice(0, 8)} | ${reason}`);
+
     const mint = activePosition.mint;
-    const spentSol = activePosition.spentSol || 0;
+    const spentSol = activePosition.spentSol;
+    const balanceBeforeSell = await getSolBalance();
+
     activePosition = null;
 
-    // Sell the token
+    // Sell token
     const sellTx = await pumpSwap(mint, 0, 'sell');
 
     if (sellTx) {
-      // Wait a moment then convert remaining SOL to USDC
-      await new Promise(r => setTimeout(r, 4000));
-      const currentBal = await getAvailableBalance();
-      await swapSolToUsdc(currentBal * 0.95); // convert most of it
+      // Wait for balance to update
+      await new Promise(r => setTimeout(r, 5000));
+      const balanceAfterSell = await getSolBalance();
 
-      // Calculate rough USD profit
-      const estimatedProfitUsd = (spentSol * (pnlPercent / 100)) * solPrice;
+      const solReceived = balanceAfterSell - balanceBeforeSell + spentSol; // rough
+      const solProfit = balanceAfterSell - (balanceBeforeSell - spentSol);
+      const usdProfit = solProfit * solPrice;
+
+      // Convert to USDC
+      await swapSolToUsdc(Math.max(0, balanceAfterSell - SOL_RESERVE - 0.01));
 
       await sendTelegram(
         `🔴 <b>Closed</b> <code>${mint.slice(0, 8)}</code>\n` +
-        `${reason}\n` +
-        `PnL: <b>${pnlPercent.toFixed(1)}%</b>\n` +
-        `Est. Profit: <b>$${estimatedProfitUsd.toFixed(2)}</b>\n` +
+        `Reason: ${reason}\n` +
+        `Spent: ${spentSol.toFixed(4)} SOL\n` +
+        `SOL Change: <b>${solProfit >= 0 ? '+' : ''}${solProfit.toFixed(4)} SOL</b>\n` +
+        `Est. Profit: <b>$${usdProfit.toFixed(2)}</b>\n` +
         `Converted to USDC`
       );
     } else {
-      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nSell manually!`);
+      await sendTelegram(`⚠️ SELL FAILED <code>${mint.slice(0, 8)}</code>\nPlease sell manually!`);
     }
   }
 }
@@ -236,7 +242,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Auto USDC Mode');
+    log('🟢 Connected – Safer Profit Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -274,7 +280,7 @@ function startWebSocket() {
         if (amount < 0.05) return;
 
         isBuying = true;
-        log(`🚀 BUYING ${amount} SOL (30%)`);
+        log(`🚀 BUYING ${amount} SOL`);
         const tx = await pumpSwap(mint, amount, 'buy');
         isBuying = false;
 
@@ -288,12 +294,10 @@ function startWebSocket() {
             spentSol: amount
           };
 
-          const spentUsd = (amount * solPrice).toFixed(2);
-
           await sendTelegram(
             `🚀 <b>ENTRY</b>\n` +
             `<code>${mint}</code>\n` +
-            `Spent: <b>${amount} SOL</b> (≈ $${spentUsd})\n` +
+            `Spent: <b>${amount} SOL</b> (≈ $${(amount * solPrice).toFixed(2)})\n` +
             `MC: $${Math.round(mc)}\n` +
             `Init: ${initialBuy.toFixed(2)} SOL`
           );
@@ -315,7 +319,7 @@ function startWebSocket() {
 // ====================== MAIN ======================
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
-  log(`Mode: 30% balance + Auto convert to USDC`);
+  log(`Safer Profit Calculation + Auto USDC`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -325,7 +329,7 @@ async function main() {
 
   setInterval(checkPosition, 7000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\n• Invests 30% of balance\n• Auto converts profits to USDC\n• Shows $ profit in alerts`);
+  await sendTelegram(`⚡ <b>Bot Updated</b>\n• Safer profit calculation (based on SOL balance)\n• Auto convert to USDC\n• Shows real $ profit`);
   startWebSocket();
 }
 
