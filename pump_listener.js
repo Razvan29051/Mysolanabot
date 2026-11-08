@@ -18,19 +18,19 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// Strategy
-const BASE_INVEST_PERCENT = 0.25;
+// ====== STRICTER BUY POWER SETTINGS ======
+const BASE_INVEST_PERCENT = 0.22;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 4000;
-const MAX_MC = 150000;
-const MIN_INITIAL_BUY = 0.38;
+const MIN_MC = 6500;                 // Higher to avoid micro dumps
+const MAX_MC = 140000;
+const MIN_INITIAL_BUY = 0.55;        // Stronger buy power required
 
-const HARD_STOP_LOSS = -7.0;
-const TRAILING_ACTIVATE = 9.0;
-const TRAILING_DROP = -5.0;
-const TAKE_PROFIT = 27.0;
-const MAX_HOLD_SECONDS = 260;
+const HARD_STOP_LOSS = -6.5;
+const TRAILING_ACTIVATE = 8.0;
+const TRAILING_DROP = -4.5;
+const TAKE_PROFIT = 22.0;            // Take profit faster
+const MAX_HOLD_SECONDS = 210;        // Don't wait long
 
 let activePosition = null;
 let processed = new Set();
@@ -43,9 +43,6 @@ let wins = 0;
 let losses = 0;
 let consecutiveLosses = 0;
 let lastLossTime = 0;
-
-// Tokens recently seen on X
-let xMentioned = new Set();
 
 // ====================== HELPERS ======================
 function log(msg) {
@@ -83,34 +80,10 @@ async function getAvailableToTrade() {
   return Math.max(0, Number((real - SOL_RESERVE).toFixed(4)));
 }
 
-function getInvestPercent(isXBoosted = false) {
-  if (consecutiveLosses >= 3) return 0.12;
-  if (consecutiveLosses === 2) return 0.17;
-  if (isXBoosted) return 0.30;			// Stronger size if seen on X
+function getInvestPercent() {
+  if (consecutiveLosses >= 3) return 0.10;
+  if (consecutiveLosses === 2) return 0.15;
   return BASE_INVEST_PERCENT;
-}
-
-// ====================== X MONITORING ======================
-async function checkXForMints() {
-  try {
-    // Using a public search approach (limited but free)
-    // This searches for recent posts containing pump.fun links
-    const query = encodeURIComponent('pump.fun OR "pump fun" (CA OR contract OR mint)');
-    const url = `https://api.apitrends.com/v1/twitter/search?q=${query}&count=20`; // example free endpoint style
-
-    // Note: Free public endpoints are unstable.
-    // For better results you should later add official X API keys.
-
-    // Placeholder logic – in production we would parse real results
-    // For now we simulate structure so the code is ready
-    log('Scanning X for new mints...');
-    
-    // In real implementation we would extract addresses here
-    // and add them to xMentioned Set
-
-  } catch (err) {
-    log(`X scan error: ${err.message}`);
-  }
 }
 
 // ====================== SWAP ======================
@@ -191,6 +164,9 @@ async function checkPosition() {
   else if (pnl >= TAKE_PROFIT) reason = `Take-Profit (+${pnl.toFixed(1)}%)`;
   else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
 
+  // Exit early if it doesn't move up
+  if (held > 45 && pnl < 3) reason = `No momentum`;
+
   if (reason) {
     log(`🔴 EXIT → ${reason}`);
     const mint = activePosition.mint;
@@ -227,7 +203,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – On-chain + X Signal Mode');
+    log('🟢 Connected – Strong Buy Power Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -240,8 +216,8 @@ function startWebSocket() {
       const isNew = !!(event.name || event.symbol || event.initialBuy);
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
-      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 80000) return;
-      if (Date.now() - lastBuyTime < 20000) return;
+      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 90000) return;
+      if (Date.now() - lastBuyTime < 25000) return;
 
       const name = (event.name || event.symbol || '').trim();
 
@@ -255,18 +231,17 @@ function startWebSocket() {
       }
       if (initialBuy > 50) initialBuy = initialBuy / 1e9;
 
-      const isXBoosted = xMentioned.has(mint);
+      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 13)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
-      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 12)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)} ${isXBoosted ? '| 🔥 X MENTIONED' : ''}`);
-
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
+      // Stronger filter for real buy power
+      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 3) {
         const available = await getAvailableToTrade();
-        const investPct = getInvestPercent(isXBoosted);
+        const investPct = getInvestPercent();
         const amount = Number((available * investPct).toFixed(4));
 
-        log(`Available: ${available} | Investing: ${amount} SOL ${isXBoosted ? '(X Boosted)' : ''}`);
+        log(`Available: ${available} | Investing: ${amount} SOL`);
 
-        if (amount < 0.045) return;
+        if (amount < 0.04) return;
 
         processed.add(mint);
         isBuying = true;
@@ -285,11 +260,11 @@ function startWebSocket() {
           };
 
           await sendTelegram(
-            `🚀 <b>ENTRY ${isXBoosted ? '🔥 X BOOSTED' : ''}</b>\n` +
+            `🚀 <b>STRONG ENTRY</b>\n` +
             `<code>${mint}</code>\n` +
             `Spent: <b>${amount} SOL</b>\n` +
             `MC: $${Math.round(mc)}\n` +
-            `Init: ${initialBuy.toFixed(2)} SOL`
+            `Init Buy: ${initialBuy.toFixed(2)} SOL`
           );
         }
       }
@@ -306,7 +281,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | X Signal Mode Active`);
+  log(`Balance: ${bal} SOL | Strong Buy Power Mode`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -314,13 +289,9 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  // Scan X every 3 minutes
-  setInterval(checkXForMints, 3 * 60 * 1000);
-  checkXForMints();
+  setInterval(checkPosition, 5000);
 
-  setInterval(checkPosition, 5500);
-
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nOn-chain + X Signal Mode\nMin InitBuy: 0.38 SOL`);
+  await sendTelegram(`⚡ <b>Bot Updated – Strong Buy Power</b>\nMin InitBuy: 0.55 SOL\nFaster exits if no momentum`);
   startWebSocket();
 }
 
