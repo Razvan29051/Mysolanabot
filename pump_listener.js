@@ -18,19 +18,19 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== FAST SETTINGS ======
+// ====== SETTINGS ======
 const BASE_INVEST_PERCENT = 0.22;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 4500;
+const MIN_MC = 2800;                 // Lowered
 const MAX_MC = 150000;
 const MIN_INITIAL_BUY = 0.30;
 
 const HARD_STOP_LOSS = -6.0;
-const TRAILING_ACTIVATE = 6.5;      // Start trailing earlier
-const TRAILING_DROP = -3.8;         // Tighter trail
-const TAKE_PROFIT = 16.0;           // Take profit much quicker
-const MAX_HOLD_SECONDS = 150;       // Max 2.5 minutes
+const TRAILING_ACTIVATE = 6.5;
+const TRAILING_DROP = -3.8;
+const TAKE_PROFIT = 16.0;
+const MAX_HOLD_SECONDS = 150;
 
 let activePosition = null;
 let processed = new Set();
@@ -204,7 +204,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Fast Profit Mode');
+    log('🟢 Connected – Lower MC Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -281,7 +281,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | Fast Profit Mode`);
+  log(`Balance: ${bal} SOL | Min MC: $${MIN_MC}`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -289,10 +289,9 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  // Faster monitoring
   setInterval(checkPosition, 4000);
 
-  await sendTelegram(`⚡ <b>Fast Profit Mode Activated</b>\nTP: +16%\nTrailing starts at +6.5%\nMax hold: 2.5 min`);
+  await sendTelegram(`⚡ <b>Bot Updated</b>\nMin MC lowered to $${MIN_MC}\nInitBuy: 0.30 SOL\nFast TP: +16%`);
   startWebSocket();
 }
 
