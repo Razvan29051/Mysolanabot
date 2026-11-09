@@ -18,19 +18,19 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== STRICTER BUY POWER SETTINGS ======
+// ====== FAST SETTINGS ======
 const BASE_INVEST_PERCENT = 0.22;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 6500;                 // Higher to avoid micro dumps
-const MAX_MC = 140000;
-const MIN_INITIAL_BUY = 0.55;        // Stronger buy power required
+const MIN_MC = 4500;
+const MAX_MC = 150000;
+const MIN_INITIAL_BUY = 0.30;
 
-const HARD_STOP_LOSS = -6.5;
-const TRAILING_ACTIVATE = 8.0;
-const TRAILING_DROP = -4.5;
-const TAKE_PROFIT = 22.0;            // Take profit faster
-const MAX_HOLD_SECONDS = 210;        // Don't wait long
+const HARD_STOP_LOSS = -6.0;
+const TRAILING_ACTIVATE = 6.5;      // Start trailing earlier
+const TRAILING_DROP = -3.8;         // Tighter trail
+const TAKE_PROFIT = 16.0;           // Take profit much quicker
+const MAX_HOLD_SECONDS = 150;       // Max 2.5 minutes
 
 let activePosition = null;
 let processed = new Set();
@@ -82,7 +82,7 @@ async function getAvailableToTrade() {
 
 function getInvestPercent() {
   if (consecutiveLosses >= 3) return 0.10;
-  if (consecutiveLosses === 2) return 0.15;
+  if (consecutiveLosses === 2) return 0.14;
   return BASE_INVEST_PERCENT;
 }
 
@@ -98,8 +98,8 @@ async function swap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: action === 'sell' ? 65 : 50,
-        priorityFee: action === 'sell' ? 0.018 : 0.013,
+        slippage: action === 'sell' ? 70 : 50,
+        priorityFee: action === 'sell' ? 0.02 : 0.014,
         pool: 'auto'
       };
 
@@ -114,9 +114,12 @@ async function swap(mint, amount, action = 'buy') {
       const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
       tx.sign([wallet]);
 
-      const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 4 });
-      await new Promise(r => setTimeout(r, 2800));
+      const txid = await connection.sendTransaction(tx, {
+        skipPreflight: true,
+        maxRetries: 4
+      });
 
+      await new Promise(r => setTimeout(r, 2200));
       const status = await connection.getSignatureStatus(txid);
       if (status?.value?.err) throw new Error('On-chain fail');
 
@@ -125,7 +128,7 @@ async function swap(mint, amount, action = 'buy') {
     } catch (err) {
       log(`❌ ${action} failed: ${err.message}`);
       if (attempt === 3) return null;
-      await new Promise(r => setTimeout(r, 1400));
+      await new Promise(r => setTimeout(r, 1100));
     }
   }
   return null;
@@ -163,9 +166,7 @@ async function checkPosition() {
   else if (pnl >= TRAILING_ACTIVATE && drop <= TRAILING_DROP) reason = `Trailing (${drop.toFixed(1)}%)`;
   else if (pnl >= TAKE_PROFIT) reason = `Take-Profit (+${pnl.toFixed(1)}%)`;
   else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
-
-  // Exit early if it doesn't move up
-  if (held > 45 && pnl < 3) reason = `No momentum`;
+  else if (held > 35 && pnl < 2) reason = `No momentum`;
 
   if (reason) {
     log(`🔴 EXIT → ${reason}`);
@@ -203,7 +204,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Strong Buy Power Mode');
+    log('🟢 Connected – Fast Profit Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -216,8 +217,8 @@ function startWebSocket() {
       const isNew = !!(event.name || event.symbol || event.initialBuy);
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
-      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 90000) return;
-      if (Date.now() - lastBuyTime < 25000) return;
+      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 80000) return;
+      if (Date.now() - lastBuyTime < 18000) return;
 
       const name = (event.name || event.symbol || '').trim();
 
@@ -233,8 +234,7 @@ function startWebSocket() {
 
       log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 13)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
-      // Stronger filter for real buy power
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 3) {
+      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
         const available = await getAvailableToTrade();
         const investPct = getInvestPercent();
         const amount = Number((available * investPct).toFixed(4));
@@ -260,11 +260,11 @@ function startWebSocket() {
           };
 
           await sendTelegram(
-            `🚀 <b>STRONG ENTRY</b>\n` +
+            `🚀 <b>ENTRY</b>\n` +
             `<code>${mint}</code>\n` +
             `Spent: <b>${amount} SOL</b>\n` +
             `MC: $${Math.round(mc)}\n` +
-            `Init Buy: ${initialBuy.toFixed(2)} SOL`
+            `Init: ${initialBuy.toFixed(2)} SOL`
           );
         }
       }
@@ -273,7 +273,7 @@ function startWebSocket() {
     }
   });
 
-  ws.on('close', () => setTimeout(startWebSocket, 5000));
+  ws.on('close', () => setTimeout(startWebSocket, 4000));
   ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
@@ -281,7 +281,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | Strong Buy Power Mode`);
+  log(`Balance: ${bal} SOL | Fast Profit Mode`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -289,9 +289,10 @@ async function main() {
     if (d?.solana?.usd) solPrice = d.solana.usd;
   } catch {}
 
-  setInterval(checkPosition, 5000);
+  // Faster monitoring
+  setInterval(checkPosition, 4000);
 
-  await sendTelegram(`⚡ <b>Bot Updated – Strong Buy Power</b>\nMin InitBuy: 0.55 SOL\nFaster exits if no momentum`);
+  await sendTelegram(`⚡ <b>Fast Profit Mode Activated</b>\nTP: +16%\nTrailing starts at +6.5%\nMax hold: 2.5 min`);
   startWebSocket();
 }
 
