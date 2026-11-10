@@ -22,9 +22,9 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const BASE_INVEST_PERCENT = 0.22;
 const SOL_RESERVE = 0.04;
 
-const MIN_MC = 2800;                 // Lowered
+const MIN_MC = 2800;
 const MAX_MC = 150000;
-const MIN_INITIAL_BUY = 0.30;
+const MIN_INITIAL_BUY = 0.25;          // Slightly lowered
 
 const HARD_STOP_LOSS = -6.0;
 const TRAILING_ACTIVATE = 6.5;
@@ -204,7 +204,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Lower MC Mode');
+    log('🟢 Connected – InitBuy 0.25 + Fast TP');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -281,7 +281,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | Min MC: $${MIN_MC}`);
+  log(`Balance: ${bal} SOL | InitBuy: 0.25 | Fast TP`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -291,7 +291,7 @@ async function main() {
 
   setInterval(checkPosition, 4000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nMin MC lowered to $${MIN_MC}\nInitBuy: 0.30 SOL\nFast TP: +16%`);
+  await sendTelegram(`⚡ <b>Bot Updated</b>\nMin InitBuy: 0.25 SOL\nFast Take-Profit: +16%\nMin MC: $2800`);
   startWebSocket();
 }
 
