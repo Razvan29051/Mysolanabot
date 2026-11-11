@@ -22,18 +22,22 @@ const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 const BASE_INVEST_PERCENT = 0.20;
 const SOL_RESERVE = 0.035;
 
-const MIN_MC = 1800;
-const MAX_MC = 180000;
-const MIN_INITIAL_BUY = 0.18;
+const MIN_MC = 2000;
+const MAX_MC = 160000;
+const MIN_INITIAL_BUY = 0.20;
 
-const HARD_STOP_LOSS = -6.0;
-const TRAILING_ACTIVATE = 6.0;
-const TRAILING_DROP = -3.5;
-const TAKE_PROFIT = 14.0;
-const MAX_HOLD_SECONDS = 140;
+const HARD_STOP_LOSS = -6.5;
+const TRAILING_ACTIVATE = 8.0;
+const TRAILING_DROP = -4.2;
+const TAKE_PROFIT = 20.0;
+
+const MIN_HOLD_SECONDS = 25;
+const MAX_HOLD_SECONDS = 240;
+const WEAK_MOMENTUM_TIME = 45;
 
 let activePosition = null;
 let processed = new Set();
+let watching = new Map();
 let isBuying = false;
 let solPrice = 180;
 let lastBuyTime = 0;
@@ -86,24 +90,22 @@ function getInvestPercent() {
   return BASE_INVEST_PERCENT;
 }
 
-// ====================== IMPROVED SWAP ======================
+// ====================== SWAP ======================
 async function swap(mint, amount, action = 'buy') {
-  const maxAttempts = 4;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      log(`${action.toUpperCase()} attempt ${attempt}/${maxAttempts} → ${mint.slice(0, 8)}`);
+      log(`${action.toUpperCase()} attempt ${attempt} → ${mint.slice(0, 8)}`);
 
       const isSell = action === 'sell';
 
       const body = {
         publicKey: wallet.publicKey.toString(),
-        action: action,
-        mint: mint,
+        action,
+        mint,
         amount: isSell ? '100%' : amount,
         denominatedInSol: isSell ? 'false' : 'true',
-        slippage: isSell ? 80 : 55,               // Higher slippage on sell
-        priorityFee: isSell ? 0.025 : 0.015,      // Higher priority on sell
+        slippage: isSell ? 80 : 55,
+        priorityFee: isSell ? 0.025 : 0.015,
         pool: 'auto'
       };
 
@@ -113,41 +115,23 @@ async function swap(mint, amount, action = 'buy') {
         body: JSON.stringify(body)
       });
 
-      if (!res.ok) {
-        const errText = await res.text();
-        throw new Error(`API error: ${errText}`);
-      }
+      if (!res.ok) throw new Error(await res.text());
 
-      const txBuffer = await res.arrayBuffer();
-      const tx = VersionedTransaction.deserialize(new Uint8Array(txBuffer));
+      const tx = VersionedTransaction.deserialize(new Uint8Array(await res.arrayBuffer()));
       tx.sign([wallet]);
 
-      const txid = await connection.sendTransaction(tx, {
-        skipPreflight: true,
-        maxRetries: 5
-      });
-
-      // Wait longer for confirmation
+      const txid = await connection.sendTransaction(tx, { skipPreflight: true, maxRetries: 5 });
       await new Promise(r => setTimeout(r, 3500));
 
       const status = await connection.getSignatureStatuses([txid]);
-      const value = status?.value?.[0];
+      if (status?.value?.[0]?.err) throw new Error('On-chain fail');
 
-      if (value?.err) {
-        throw new Error(`On-chain error: ${JSON.stringify(value.err)}`);
-      }
-
-      log(`✅ ${action.toUpperCase()} SUCCESS → ${txid}`);
+      log(`✅ ${action.toUpperCase()} SUCCESS`);
       return txid;
-
     } catch (err) {
-      log(`❌ ${action} attempt ${attempt} failed: ${err.message}`);
-      
-      if (attempt === maxAttempts) {
-        return null;
-      }
-      // Wait before retry
-      await new Promise(r => setTimeout(r, 2000));
+      log(`❌ ${action} failed: ${err.message}`);
+      if (attempt === 4) return null;
+      await new Promise(r => setTimeout(r, 1800));
     }
   }
   return null;
@@ -165,37 +149,47 @@ async function getCurrentMc(mint) {
   return 0;
 }
 
-// ====================== MONITOR ======================
+// ====================== SMART MONITOR ======================
 async function checkPosition() {
   if (!activePosition) return;
 
   const mc = await getCurrentMc(activePosition.mint);
   if (mc <= 0) return;
 
-  if (mc > activePosition.highestMc) activePosition.highestMc = mc;
+  if (mc > activePosition.highestMc) {
+    activePosition.highestMc = mc;
+    activePosition.lastUpTime = Date.now();
+  }
 
   const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
   const drop = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
   const held = (Date.now() - activePosition.entryTime) / 1000;
+  const timeSinceHigh = (Date.now() - (activePosition.lastUpTime || activePosition.entryTime)) / 1000;
 
   log(`Monitor → PnL ${pnl.toFixed(1)}% | Drop ${drop.toFixed(1)}% | Held ${held.toFixed(0)}s`);
 
   let reason = null;
-  if (pnl <= HARD_STOP_LOSS) reason = `Hard SL (${pnl.toFixed(1)}%)`;
-  else if (pnl >= TRAILING_ACTIVATE && drop <= TRAILING_DROP) reason = `Trailing (${drop.toFixed(1)}%)`;
-  else if (pnl >= TAKE_PROFIT) reason = `Take-Profit (+${pnl.toFixed(1)}%)`;
-  else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
-  else if (held > 30 && pnl < 1.5) reason = `No momentum`;
+
+  if (pnl <= HARD_STOP_LOSS) reason = `Hard Stop Loss`;
+  else if (pnl >= TAKE_PROFIT) reason = `Take Profit`;
+  else if (pnl >= TRAILING_ACTIVATE && drop <= TRAILING_DROP) reason = `Trailing Stop`;
+  else if (held > WEAK_MOMENTUM_TIME && timeSinceHigh > 35 && pnl < 6) reason = `Lost Momentum`;
+  else if (held > MAX_HOLD_SECONDS) reason = `Max Hold Time`;
+  else if (held < MIN_HOLD_SECONDS && pnl > -4) return;
 
   if (reason) {
-    log(`🔴 EXIT → ${reason}`);
+    log(`🔴 SELL SIGNAL → ${reason}`);
     const mint = activePosition.mint;
     const spent = activePosition.spentSol;
+    const entryMc = activePosition.entryMc;
     activePosition = null;
 
     const tx = await swap(mint, 0, 'sell');
 
     if (tx) {
+      const profitSol = spent * (pnl / 100);
+      const profitUsd = profitSol * solPrice;
+
       if (pnl >= 0) {
         wins++;
         consecutiveLosses = 0;
@@ -205,22 +199,75 @@ async function checkPosition() {
         lastLossTime = Date.now();
       }
 
+      const resultEmoji = pnl >= 0 ? '🟢' : '🔴';
+      const sign = pnl >= 0 ? '+' : '';
+
       await sendTelegram(
-        `🔴 <b>Closed</b>\n<code>${mint.slice(0, 8)}</code>\n${reason}\nSpent: ${spent} SOL\nRecord: ${wins}W / ${losses}L`
+        `${resultEmoji} <b>SELL</b> ${resultEmoji}\n` +
+        `<code>${mint.slice(0, 10)}...</code>\n\n` +
+        `Reason: <b>${reason}</b>\n` +
+        `PnL: <b>${sign}${pnl.toFixed(2)}%</b>\n` +
+        `Profit: <b>${sign}${profitSol.toFixed(4)} SOL</b> (≈ $${profitUsd.toFixed(2)})\n` +
+        `Spent: ${spent} SOL\n\n` +
+        `📊 Record: <b>${wins}W – ${losses}L</b>`
       );
     } else {
-      await sendTelegram(
-        `⚠️ <b>SELL FAILED</b>\n<code>${mint}</code>\nPlease sell manually on Phantom/Photon!`
-      );
+      await sendTelegram(`⚠️ <b>SELL FAILED</b>\n<code>${mint}</code>\nPlease sell manually!`);
+    }
+  }
+}
+
+// ====================== WATCH FOR ENTRY ======================
+async function checkWatching() {
+  for (const [mint, data] of watching.entries()) {
+    const elapsed = Date.now() - data.firstTime;
+    if (elapsed < 7000) continue;
+
+    const currentMc = await getCurrentMc(mint);
+    watching.delete(mint);
+
+    if (currentMc <= 0 || activePosition || isBuying) continue;
+
+    const change = ((currentMc - data.firstMc) / data.firstMc) * 100;
+    log(`Watch ${mint.slice(0, 8)} → ${change.toFixed(1)}%`);
+
+    if (change >= 3.5) {
+      const available = await getAvailableToTrade();
+      const amount = Number((available * getInvestPercent()).toFixed(4));
+      if (amount < 0.035) continue;
+
+      isBuying = true;
+      log(`🟢 BUY SIGNAL → Momentum +${change.toFixed(1)}%`);
+      const tx = await swap(mint, amount, 'buy');
+      isBuying = false;
+
+      if (tx) {
+        lastBuyTime = Date.now();
+        activePosition = {
+          mint,
+          entryMc: currentMc,
+          highestMc: currentMc,
+          entryTime: Date.now(),
+          lastUpTime: Date.now(),
+          spentSol: amount
+        };
+
+        await sendTelegram(
+          `🟢 <b>BUY</b> 🟢\n` +
+          `<code>${mint}</code>\n\n` +
+          `Spent: <b>${amount} SOL</b> (≈ $${(amount * solPrice).toFixed(2)})\n` +
+          `Momentum: <b>+${change.toFixed(1)}%</b>\n` +
+          `MC: $${Math.round(currentMc)}\n\n` +
+          `📊 Record: ${wins}W – ${losses}L`
+        );
+      }
     }
   }
 }
 
 // ====================== WEBSOCKET ======================
 function startWebSocket() {
-  if (ws) {
-    try { ws.terminate(); } catch {}
-  }
+  if (ws) try { ws.terminate(); } catch {}
 
   const url = PUMPPORTAL_API_KEY
     ? `wss://pumpportal.fun/api/data?api-key=${PUMPPORTAL_API_KEY}`
@@ -229,7 +276,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Improved Sell Logic');
+    log('🟢 Connected – Smart Mode with clear signals');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -240,12 +287,10 @@ function startWebSocket() {
 
       const mint = event.mint;
       const isNew = !!(event.name || event.symbol || event.initialBuy);
-      if (!isNew || processed.has(mint) || activePosition || isBuying) return;
+      if (!isNew || processed.has(mint) || activePosition || isBuying || watching.has(mint)) return;
 
       if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 70000) return;
       if (Date.now() - lastBuyTime < 15000) return;
-
-      const name = (event.name || event.symbol || '').trim();
 
       let mc = 0;
       if (event.marketCapSol) mc = event.marketCapSol * solPrice;
@@ -257,52 +302,20 @@ function startWebSocket() {
       }
       if (initialBuy > 50) initialBuy = initialBuy / 1e9;
 
-      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 14)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+      const name = (event.name || event.symbol || '').trim();
+      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 13)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 1) {
-        const available = await getAvailableToTrade();
-        const investPct = getInvestPercent();
-        const amount = Number((available * investPct).toFixed(4));
-
-        log(`Available: ${available} SOL | Will invest: ${amount} SOL`);
-
-        if (amount < 0.035) return;
-
+      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY) {
         processed.add(mint);
-        isBuying = true;
-
-        const tx = await swap(mint, amount, 'buy');
-        isBuying = false;
-
-        if (tx) {
-          lastBuyTime = Date.now();
-          activePosition = {
-            mint,
-            entryMc: mc,
-            highestMc: mc,
-            entryTime: Date.now(),
-            spentSol: amount
-          };
-
-          await sendTelegram(
-            `🚀 <b>ENTRY</b>\n` +
-            `<code>${mint}</code>\n` +
-            `Spent: <b>${amount} SOL</b>\n` +
-            `MC: $${Math.round(mc)}\n` +
-            `Init: ${initialBuy.toFixed(2)} SOL`
-          );
-        }
+        watching.set(mint, { firstMc: mc, firstTime: Date.now() });
+        log(`👀 Watching ${mint.slice(0, 8)} for buy signal...`);
       }
     } catch (err) {
       log(`Error: ${err.message}`);
     }
   });
 
-  ws.on('close', () => {
-    log('WS closed. Reconnecting in 4s...');
-    setTimeout(startWebSocket, 4000);
-  });
-
+  ws.on('close', () => setTimeout(startWebSocket, 4000));
   ws.on('error', (err) => log(`WS Error: ${err.message}`));
 }
 
@@ -319,8 +332,13 @@ async function main() {
   } catch {}
 
   setInterval(checkPosition, 4000);
+  setInterval(checkWatching, 3000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nImproved sell reliability\nHigher slippage + priority fee on sells`);
+  await sendTelegram(
+    `⚡ <b>Bot Started</b>\n` +
+    `Clear BUY / SELL signals enabled\n` +
+    `Will show profit + Win/Loss record`
+  );
   startWebSocket();
 }
 
