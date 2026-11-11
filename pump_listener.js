@@ -30,18 +30,10 @@ const HARD_STOP_LOSS = -6.5;
 const TRAILING_ACTIVATE = 7.5;
 const TRAILING_DROP = -4.0;
 const TAKE_PROFIT = 18.0;
-
-const MIN_HOLD_SECONDS = 20;
-const MAX_HOLD_SECONDS = 210;
-const WEAK_MOMENTUM_TIME = 40;
-
-// Faster watch time
-const WATCH_TIME_MS = 4500;          // 4.5 seconds only
-const MIN_MOMENTUM_PERCENT = 2.8;
+const MAX_HOLD_SECONDS = 180;
 
 let activePosition = null;
 let processed = new Set();
-let watching = new Map();
 let isBuying = false;
 let solPrice = 180;
 let lastBuyTime = 0;
@@ -135,7 +127,7 @@ async function swap(mint, amount, action = 'buy') {
     } catch (err) {
       log(`❌ ${action} failed: ${err.message}`);
       if (attempt === 4) return null;
-      await new Promise(r => setTimeout(r, 1600));
+      await new Promise(r => setTimeout(r, 1500));
     }
   }
   return null;
@@ -153,7 +145,7 @@ async function getCurrentMc(mint) {
   return 0;
 }
 
-// ====================== MONITOR (SELL LOGIC) ======================
+// ====================== MONITOR ======================
 async function checkPosition() {
   if (!activePosition) return;
 
@@ -162,13 +154,11 @@ async function checkPosition() {
 
   if (mc > activePosition.highestMc) {
     activePosition.highestMc = mc;
-    activePosition.lastUpTime = Date.now();
   }
 
   const pnl = ((mc - activePosition.entryMc) / activePosition.entryMc) * 100;
   const drop = ((mc - activePosition.highestMc) / activePosition.highestMc) * 100;
   const held = (Date.now() - activePosition.entryTime) / 1000;
-  const timeSinceHigh = (Date.now() - (activePosition.lastUpTime || activePosition.entryTime)) / 1000;
 
   log(`Monitor → PnL ${pnl.toFixed(1)}% | Drop ${drop.toFixed(1)}% | Held ${held.toFixed(0)}s`);
 
@@ -177,13 +167,11 @@ async function checkPosition() {
   if (pnl <= HARD_STOP_LOSS) reason = `Hard Stop Loss`;
   else if (pnl >= TAKE_PROFIT) reason = `Take Profit`;
   else if (pnl >= TRAILING_ACTIVATE && drop <= TRAILING_DROP) reason = `Trailing Stop`;
-  else if (held > WEAK_MOMENTUM_TIME && timeSinceHigh > 30 && pnl < 5) reason = `Lost Momentum`;
   else if (held > MAX_HOLD_SECONDS) reason = `Max Hold Time`;
-  else if (held < MIN_HOLD_SECONDS && pnl > -4) return;
 
   if (reason) {
     log(`🔴 SELL SIGNAL → ${reason} | PnL: ${pnl.toFixed(1)}%`);
-    
+
     const mint = activePosition.mint;
     const spent = activePosition.spentSol;
     activePosition = null;
@@ -221,57 +209,6 @@ async function checkPosition() {
   }
 }
 
-// ====================== FAST WATCH + BUY SIGNAL ======================
-async function checkWatching() {
-  for (const [mint, data] of watching.entries()) {
-    const elapsed = Date.now() - data.firstTime;
-    if (elapsed < WATCH_TIME_MS) continue;
-
-    const currentMc = await getCurrentMc(mint);
-    watching.delete(mint);
-
-    if (currentMc <= 0 || activePosition || isBuying) continue;
-
-    const change = ((currentMc - data.firstMc) / data.firstMc) * 100;
-    log(`Watch result ${mint.slice(0, 8)} → ${change.toFixed(1)}%`);
-
-    if (change >= MIN_MOMENTUM_PERCENT) {
-      const available = await getAvailableToTrade();
-      const amount = Number((available * getInvestPercent()).toFixed(4));
-      if (amount < 0.035) continue;
-
-      isBuying = true;
-      log(`🟢 BUY SIGNAL → +${change.toFixed(1)}% momentum`);
-      
-      const tx = await swap(mint, amount, 'buy');
-      isBuying = false;
-
-      if (tx) {
-        lastBuyTime = Date.now();
-        activePosition = {
-          mint,
-          entryMc: currentMc,
-          highestMc: currentMc,
-          entryTime: Date.now(),
-          lastUpTime: Date.now(),
-          spentSol: amount
-        };
-
-        await sendTelegram(
-          `🟢 <b>BUY 🟢</b>\n` +
-          `<code>${mint}</code>\n\n` +
-          `Spent: <b>${amount} SOL</b> (≈ $${(amount * solPrice).toFixed(2)})\n` +
-          `Momentum: <b>+${change.toFixed(1)}%</b>\n` +
-          `Entry MC: $${Math.round(currentMc)}\n\n` +
-          `📊 Record: ${wins}W – ${losses}L`
-        );
-      }
-    } else {
-      log(`Skipped ${mint.slice(0, 8)} – weak signal (${change.toFixed(1)}%)`);
-    }
-  }
-}
-
 // ====================== WEBSOCKET ======================
 function startWebSocket() {
   if (ws) try { ws.terminate(); } catch {}
@@ -283,7 +220,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – Fast Signal Mode');
+    log('🟢 Connected – Instant Entry Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -294,7 +231,7 @@ function startWebSocket() {
 
       const mint = event.mint;
       const isNew = !!(event.name || event.symbol || event.initialBuy);
-      if (!isNew || processed.has(mint) || activePosition || isBuying || watching.has(mint)) return;
+      if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
       if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 60000) return;
       if (Date.now() - lastBuyTime < 14000) return;
@@ -313,12 +250,37 @@ function startWebSocket() {
       log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 13)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
       if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY) {
+        const available = await getAvailableToTrade();
+        const amount = Number((available * getInvestPercent()).toFixed(4));
+
+        if (amount < 0.035) return;
+
         processed.add(mint);
-        watching.set(mint, {
-          firstMc: mc,
-          firstTime: Date.now()
-        });
-        log(`👀 Watching ${mint.slice(0, 8)} (${WATCH_TIME_MS/1000}s)...`);
+        isBuying = true;
+
+        log(`🟢 BUY SIGNAL → ${mint.slice(0, 8)} | ${amount} SOL`);
+        const tx = await swap(mint, amount, 'buy');
+        isBuying = false;
+
+        if (tx) {
+          lastBuyTime = Date.now();
+          activePosition = {
+            mint,
+            entryMc: mc,
+            highestMc: mc,
+            entryTime: Date.now(),
+            spentSol: amount
+          };
+
+          await sendTelegram(
+            `🟢 <b>BUY 🟢</b>\n` +
+            `<code>${mint}</code>\n\n` +
+            `Spent: <b>${amount} SOL</b> (≈ $${(amount * solPrice).toFixed(2)})\n` +
+            `MC: $${Math.round(mc)}\n` +
+            `Init Buy: ${initialBuy.toFixed(2)} SOL\n\n` +
+            `📊 Record: ${wins}W – ${losses}L`
+          );
+        }
       }
     } catch (err) {
       log(`Error: ${err.message}`);
@@ -333,7 +295,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | Fast Signal Mode`);
+  log(`Balance: ${bal} SOL | Instant Entry Mode`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -342,13 +304,12 @@ async function main() {
   } catch {}
 
   setInterval(checkPosition, 3500);
-  setInterval(checkWatching, 2000);
 
   await sendTelegram(
     `⚡ <b>Bot Updated</b>\n` +
-    `• Faster watch time (4.5s)\n` +
-    `• Clear BUY / SELL indicators\n` +
-    `• Shows profit + Win/Loss`
+    `• No more watching time\n` +
+    `• Instant entry on signal\n` +
+    `• Clear BUY / SELL + Profit tracking`
   );
   startWebSocket();
 }
