@@ -18,19 +18,19 @@ if (!RPC_ENDPOINT || !RAW_PRIVATE_KEY) {
 const connection = new Connection(RPC_ENDPOINT, 'confirmed');
 const wallet = Keypair.fromSecretKey(bs58.decode(RAW_PRIVATE_KEY));
 
-// ====== SETTINGS ======
-const BASE_INVEST_PERCENT = 0.22;
-const SOL_RESERVE = 0.04;
+// ====== MORE ACTIVE SETTINGS ======
+const BASE_INVEST_PERCENT = 0.20;
+const SOL_RESERVE = 0.035;
 
-const MIN_MC = 2800;
-const MAX_MC = 150000;
-const MIN_INITIAL_BUY = 0.25;          // Slightly lowered
+const MIN_MC = 1800;                // Lower
+const MAX_MC = 180000;
+const MIN_INITIAL_BUY = 0.18;       // Lower so it finds trades
 
 const HARD_STOP_LOSS = -6.0;
-const TRAILING_ACTIVATE = 6.5;
-const TRAILING_DROP = -3.8;
-const TAKE_PROFIT = 16.0;
-const MAX_HOLD_SECONDS = 150;
+const TRAILING_ACTIVATE = 6.0;
+const TRAILING_DROP = -3.5;
+const TAKE_PROFIT = 14.0;           // Still take profit quickly
+const MAX_HOLD_SECONDS = 140;
 
 let activePosition = null;
 let processed = new Set();
@@ -98,8 +98,8 @@ async function swap(mint, amount, action = 'buy') {
         mint,
         amount: action === 'sell' ? '100%' : amount,
         denominatedInSol: action === 'sell' ? 'false' : 'true',
-        slippage: action === 'sell' ? 70 : 50,
-        priorityFee: action === 'sell' ? 0.02 : 0.014,
+        slippage: action === 'sell' ? 70 : 55,
+        priorityFee: action === 'sell' ? 0.02 : 0.015,
         pool: 'auto'
       };
 
@@ -128,7 +128,7 @@ async function swap(mint, amount, action = 'buy') {
     } catch (err) {
       log(`❌ ${action} failed: ${err.message}`);
       if (attempt === 3) return null;
-      await new Promise(r => setTimeout(r, 1100));
+      await new Promise(r => setTimeout(r, 1000));
     }
   }
   return null;
@@ -166,7 +166,7 @@ async function checkPosition() {
   else if (pnl >= TRAILING_ACTIVATE && drop <= TRAILING_DROP) reason = `Trailing (${drop.toFixed(1)}%)`;
   else if (pnl >= TAKE_PROFIT) reason = `Take-Profit (+${pnl.toFixed(1)}%)`;
   else if (held > MAX_HOLD_SECONDS) reason = `Max hold`;
-  else if (held > 35 && pnl < 2) reason = `No momentum`;
+  else if (held > 30 && pnl < 1.5) reason = `No momentum`;
 
   if (reason) {
     log(`🔴 EXIT → ${reason}`);
@@ -204,7 +204,7 @@ function startWebSocket() {
   ws = new WebSocket(url);
 
   ws.on('open', () => {
-    log('🟢 Connected – InitBuy 0.25 + Fast TP');
+    log('🟢 Connected – Active Mode');
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
 
@@ -217,8 +217,8 @@ function startWebSocket() {
       const isNew = !!(event.name || event.symbol || event.initialBuy);
       if (!isNew || processed.has(mint) || activePosition || isBuying) return;
 
-      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 80000) return;
-      if (Date.now() - lastBuyTime < 18000) return;
+      if (consecutiveLosses >= 2 && Date.now() - lastLossTime < 70000) return;
+      if (Date.now() - lastBuyTime < 15000) return;   // Shorter cooldown
 
       const name = (event.name || event.symbol || '').trim();
 
@@ -232,16 +232,16 @@ function startWebSocket() {
       }
       if (initialBuy > 50) initialBuy = initialBuy / 1e9;
 
-      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 13)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
+      log(`New: ${mint.slice(0, 8)} | ${name.substring(0, 14)} | MC $${Math.round(mc)} | Init ${initialBuy.toFixed(2)}`);
 
-      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 2) {
+      if (mc >= MIN_MC && mc <= MAX_MC && initialBuy >= MIN_INITIAL_BUY && name.length >= 1) {
         const available = await getAvailableToTrade();
         const investPct = getInvestPercent();
         const amount = Number((available * investPct).toFixed(4));
 
         log(`Available: ${available} | Investing: ${amount} SOL`);
 
-        if (amount < 0.04) return;
+        if (amount < 0.035) return;
 
         processed.add(mint);
         isBuying = true;
@@ -281,7 +281,7 @@ function startWebSocket() {
 async function main() {
   log(`Wallet: ${wallet.publicKey.toString()}`);
   const bal = await getRealBalance();
-  log(`Balance: ${bal} SOL | InitBuy: 0.25 | Fast TP`);
+  log(`Balance: ${bal} SOL | Active Mode (lower filters)`);
 
   try {
     const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
@@ -291,7 +291,7 @@ async function main() {
 
   setInterval(checkPosition, 4000);
 
-  await sendTelegram(`⚡ <b>Bot Updated</b>\nMin InitBuy: 0.25 SOL\nFast Take-Profit: +16%\nMin MC: $2800`);
+  await sendTelegram(`⚡ <b>Bot Updated - Active Mode</b>\nMin InitBuy: 0.18\nMin MC: $1800\nFast TP: +14%`);
   startWebSocket();
 }
 
